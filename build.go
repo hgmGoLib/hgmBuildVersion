@@ -1,0 +1,103 @@
+package hgmBuildVersion
+
+// build.go — 打包侧: 生成本次打包的版本号。
+//
+// ★这里是【唯一】允许生成版本号的地方。同一次打包出来的所有二进制必须共用同一个版本号:
+// 调用方只调一次 NewBuildVersion, 然后把结果传给每个 target 的 go build。
+// 怎么注入进二进制 / 运行期怎么读, 本包不管 (现成的做法见子包 hgmBuildVersionCurrent)。
+
+import (
+	"fmt"
+	"io/ioutil"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// GBuildTimeZoneOffsetSecond 版本号时间戳用的时区, 相对 UTC 的固定偏移秒数。默认 8*3600 = UTC+8。
+// 要用别的时区 (例 UTC 设成 0): 在打包程序里、调 NewBuildVersion 之前设一次。
+//
+// ★只给固定偏移, 不接受地名时区 (*time.Location): 带夏令时的时区在回拨那一小时里时间戳会倒退,
+// 后打的包反而不算升级。固定偏移也不依赖打包机上有没有 tzdata。
+//
+// ★时区不写进版本号, 而时间戳决定新旧: 一个项目定下来之后就【不要再改】。
+// 非改不可时 (例 UTC+8 改成 UTC): 改完后那 8 小时内打的包时间戳比改之前的小, 不算升级;
+// 所以必须同时把 versionPrefix.txt 的版本号升一级顶过去。
+var GBuildTimeZoneOffsetSecond = 8 * 3600
+
+// NewBuildVersion 读 versionPrefixPath + 取当前时间 (时区见 GBuildTimeZoneOffsetSecond) + 问 git 要 commitId/脏否, 生成本次打包的版本号。
+//
+// versionPrefixPath 版本号前缀文件 (一般是 <仓库根>/versionPrefix.txt) 的路径, 由调用方给。
+// ★本包不假设当前目录在哪: git 也在这个文件所在的目录里跑, 取的是【这个文件所在仓库】的 HEAD/脏否。
+// ★需要本机有 git 命令且该文件在 git 仓库里: 没有 git (例如从源码压缩包构建) 直接返回 error, 不猜。
+//
+// ★工作区脏的时候【照样打】, 只是版本号末尾变成 .d: 开发期工作区基本总是脏的,
+// 在这里拦一刀等于没法测试。".d" 只给人事后溯源看 —— 它不参与比大小, 也拦不住任何事。
+// 脏否用 git status --porcelain 判: 没被 .gitignore 掉的未跟踪文件也算脏。
+//
+// 正式发布 (要发给别人 / 上线) 用 NewReleaseVersion。
+func NewBuildVersion(versionPrefixPath string) (string, error) {
+	return newVersion(versionPrefixPath, false)
+}
+
+// NewReleaseVersion 同 NewBuildVersion, 但多两道闸, 任一不满足就返回 error 不出版本号:
+//
+//  1. 工作区必须干净 (结果一定是 .r): .d 的包有未提交的修改, 拿着版本号找不回准确的源码。
+//  2. HEAD 必须已经推送 (至少被一个远端跟踪分支包含, 即 git branch -r --contains HEAD 非空):
+//     没推送的 commit 只在打包机上, 别人拿着版本号里的 commitId 找不到代码。
+//     ★看的是本地记录的远端跟踪分支 (git push / git fetch 时更新), 不联网去问远端。
+//
+// 发布脚本用它代替自己再跑一遍 git status。开发测试打包用 NewBuildVersion (脏工作区照样打)。
+func NewReleaseVersion(versionPrefixPath string) (string, error) {
+	return newVersion(versionPrefixPath, true)
+}
+
+// newVersion NewBuildVersion / NewReleaseVersion 的共同实现。release=true 时多查 干净 + 已推送。
+func newVersion(versionPrefixPath string, release bool) (string, error) {
+	data, err := ioutil.ReadFile(versionPrefixPath)
+	if err != nil {
+		return "", fmt.Errorf("读版本号前缀 %s 失败: %w", versionPrefixPath, err)
+	}
+	prefix := strings.TrimSpace(string(data))
+	if prefix == "" {
+		return "", fmt.Errorf("%s 是空的, 里面应该是版本号前缀, 例 v0.1", versionPrefixPath)
+	}
+	gitDir := filepath.Dir(versionPrefixPath)
+	revCmd := exec.Command("git", "rev-parse", "HEAD")
+	revCmd.Dir = gitDir
+	out, err := revCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("取 git commitId 失败 (%s 不在 git 仓库里?): %w", gitDir, err)
+	}
+	commitId := strings.TrimSpace(string(out))
+	stCmd := exec.Command("git", "status", "--porcelain")
+	stCmd.Dir = gitDir
+	st, err := stCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("取 git status 失败: %w", err)
+	}
+	dirty := strings.TrimSpace(string(st)) != ""
+	if release {
+		if dirty {
+			return "", fmt.Errorf("正式发布要求工作区干净, 但 %s 所在仓库有未提交的修改 (git status --porcelain):\n%s", gitDir, st)
+		}
+		brCmd := exec.Command("git", "branch", "-r", "--contains", commitId)
+		brCmd.Dir = gitDir
+		br, err := brCmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("查 HEAD 有没有推送失败 (git branch -r --contains): %w", err)
+		}
+		if strings.TrimSpace(string(br)) == "" {
+			return "", fmt.Errorf("正式发布要求 HEAD (%s) 已推送到远端, 但没有任何远端跟踪分支包含它: 先 git push", commitId)
+		}
+	}
+	stamp := time.Now().In(time.FixedZone("", GBuildTimeZoneOffsetSecond)).Format("060102150405")
+	version := makeVersion(prefix, stamp, commitId, dirty)
+	// 拼完立刻校一遍: 前缀写错 (段数不对/带字母) 在这里就炸, 而不是等到部署后升不了级。
+	if !IsValid(version) {
+		return "", fmt.Errorf("拼出来的版本号 %q 不合法: 检查 %s 的内容, 应形如 v0.1 (两段纯数字, 不许前导零)",
+			version, versionPrefixPath)
+	}
+	return version, nil
+}
