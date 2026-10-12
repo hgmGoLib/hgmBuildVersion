@@ -7,17 +7,22 @@
 ## 版本号形态
 
 ```
-v0.1.260909155041-8d8358905d.r
+v0.1.260909155041-a1b2c3d4e5-r
 ```
 
 | 段 | 含义 |
 |---|---|
 | `v0.1` | versionPrefix.txt 的内容 (人手改, 两段十进制, 不许前导零) |
 | `260909155041` | 打包时的时间 YYMMDDhhmmss (定长 12 位; 时区 = GBuildTimeZoneOffsetSecond, 默认 UTC+8) |
-| `8d8358905d` | 打包时 git HEAD 的 commitId 前 10 位 (小写 hex) |
+| `a1b2c3d4e5` | 打包时 git HEAD 的 commitId 前 10 位 (小写 hex) |
 | `r` / `d` | 打包时工作区干净 (release) / 有未提交修改 (dirty) |
 
-格式整串锁死: `v<数字>.<数字>.<12位数字>-<10位小写hex>.<r|d>`。
+格式整串锁死: `v<数字>.<数字>.<12位数字>-<10位小写hex>-<r|d>`。
+
+commitId 和脏否之间用 `-` 不用 `.`: semver 预发布段按 `.` 切标识符, 全数字标识符不许前导零。
+用 `-` 连成一个标识符后它永远不是数字型, commitId 碰巧全是数字且以 0 开头时也是合法 semver (早期用 `.` 时这约千分之一的串不合法)。
+
+改格式 / 已部署的旧二进制怎么升上来: 见 [formatMigration.md](formatMigration.md)。本库只认当前格式。
 
 ## 序 与 身份
 
@@ -63,8 +68,9 @@ v0.1.260909155041-8d8358905d.r
   "已推送"看的是本地的远端跟踪分支 (`git branch -r --contains`), 不联网: 打包不应该依赖网络, 而 git push 之后它就是准的。
 - NewBuildVersion / NewReleaseVersion 是唯一生成版本号的地方。同一次打包的所有二进制必须共用同一个版本号: 调用方只调一次, 结果传给每个 go build。
 - 不假设当前目录: git 在 versionPrefix.txt 所在目录里跑, 取的是这个文件所在仓库的 HEAD / 脏否。
-- 工作区脏的时候照样打, 只是末尾变成 `.d`: 开发期工作区基本总是脏的, 在这里拦等于没法测试。`.d` 只供事后溯源, 不参与比大小。
-- git 是硬依赖: 没有 git / 不在 git 仓库里直接返回 error, 不猜一个 commitId。
+- 工作区脏的时候照样打, 只是末尾变成 `-d`: 开发期工作区基本总是脏的, 在这里拦等于没法测试。`-d` 只供事后溯源, 不参与比大小。
+- git 是硬依赖: 没有 git / 不在 git 仓库里直接返回 error, 不猜一个 commitId。git 报错时 error 里带上 git 的 stderr (safe.directory / 空仓库 等原因都是 exit status 128, 只看退出码分不清)。
+- versionPrefix.txt 本身必须被 git 跟踪 (`git ls-files --error-unmatch`), 否则返回 error: git status 不报被 ignore 的文件, 不查的话被 ignore 的前缀文件照样出 `-r`; 放在没有 .git 的被 ignore 子目录里时, git 往上找到外层仓库, commitId 也是外层的。
 - 脏否用 `git status --porcelain` 判: 没被 .gitignore 掉的未跟踪文件也算脏。
 - 时区 = 全局变量 GBuildTimeZoneOffsetSecond (相对 UTC 的固定偏移秒数, 默认 8*3600 = UTC+8), 打包程序在调 NewBuildVersion 前设一次。
   - 只给固定偏移, 不接受地名时区 (*time.Location): 带夏令时的时区在回拨那一小时里时间戳会倒退, 后打的包不算升级; 固定偏移也不依赖打包机的 tzdata、不受打包机本地时区影响。
@@ -82,8 +88,8 @@ v0.1.260909155041-8d8358905d.r
   git 不看 versionPrefix.txt 所在目录 (cmd.Dir), 取到的是这些变量指向的那个仓库的 HEAD / 脏否。在这种环境里调用前, 先清掉这几个变量。
 - **脏否受 git 配置影响**: 脏否用的是不带额外参数的 `git status --porcelain`, 会读用户 / 仓库的 git 配置。
   配了 `status.showUntrackedFiles=no` 时未跟踪文件不算脏; 子模块配了 `ignore=all` (或 `diff.ignoreSubmodules`) 时子模块里的修改不算脏。
-  这时 NewBuildVersion 会把脏工作区标成 `.r`, NewReleaseVersion 的"工作区干净"检查也会漏掉。打包机上不要改这几项配置。
-- **NewReleaseVersion 不检查子模块有没有推送**: "已推送"只查顶层仓库的 HEAD。子模块里钉的 commit 没推送时照样能出 `.r` 版本号,
+  这时 NewBuildVersion 会把脏工作区标成 `-r`, NewReleaseVersion 的"工作区干净"检查也会漏掉。打包机上不要改这几项配置。
+- **NewReleaseVersion 不检查子模块有没有推送**: "已推送"只查顶层仓库的 HEAD。子模块里钉的 commit 没推送时照样能出 `-r` 版本号,
   别人拿着版本号能找到顶层代码, 但找不到那个子模块 commit。有子模块的项目, 发布前自己确认子模块都推送了。
 - **IsValid 不检查时间戳是不是真实日期**: 第三段只要求 12 位数字, `v0.1.999999999999-…` 也是合法版本号。
   这种串一旦被当成"最新版本"下发过一次 (手误或被篡改), 同一前缀下之后正常打的包都比它"旧", 再也不算升级, 只能升 versionPrefix.txt 的版本号顶过去。

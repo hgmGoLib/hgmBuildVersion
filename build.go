@@ -7,6 +7,7 @@ package hgmBuildVersion
 // 怎么注入进二进制 / 运行期怎么读, 本包不管 (现成的做法见子包 hgmBuildVersionCurrent)。
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os/exec"
@@ -30,10 +31,10 @@ var GBuildTimeZoneOffsetSecond = 8 * 3600
 //
 // versionPrefixPath 版本号前缀文件 (一般是 <仓库根>/versionPrefix.txt) 的路径, 由调用方给。
 // ★本包不假设当前目录在哪: git 也在这个文件所在的目录里跑, 取的是【这个文件所在仓库】的 HEAD/脏否。
-// ★需要本机有 git 命令且该文件在 git 仓库里: 没有 git (例如从源码压缩包构建) 直接返回 error, 不猜。
+// ★需要本机有 git 命令且该文件已被 git 跟踪: 没有 git (例如从源码压缩包构建) / 文件没 git add / 被 .gitignore 掉 直接返回 error, 不猜。
 //
-// ★工作区脏的时候【照样打】, 只是版本号末尾变成 .d: 开发期工作区基本总是脏的,
-// 在这里拦一刀等于没法测试。".d" 只给人事后溯源看 —— 它不参与比大小, 也拦不住任何事。
+// ★工作区脏的时候【照样打】, 只是版本号末尾变成 -d: 开发期工作区基本总是脏的,
+// 在这里拦一刀等于没法测试。"-d" 只给人事后溯源看 —— 它不参与比大小, 也拦不住任何事。
 // 脏否用 git status --porcelain 判: 没被 .gitignore 掉的未跟踪文件也算脏。
 //
 // 正式发布 (要发给别人 / 上线) 用 NewReleaseVersion。
@@ -43,7 +44,7 @@ func NewBuildVersion(versionPrefixPath string) (string, error) {
 
 // NewReleaseVersion 同 NewBuildVersion, 但多两道闸, 任一不满足就返回 error 不出版本号:
 //
-//  1. 工作区必须干净 (结果一定是 .r): .d 的包有未提交的修改, 拿着版本号找不回准确的源码。
+//  1. 工作区必须干净 (结果一定是 -r): -d 的包有未提交的修改, 拿着版本号找不回准确的源码。
 //  2. HEAD 必须已经推送 (至少被一个远端跟踪分支包含, 即 git branch -r --contains HEAD 非空):
 //     没推送的 commit 只在打包机上, 别人拿着版本号里的 commitId 找不到代码。
 //     ★看的是本地记录的远端跟踪分支 (git push / git fetch 时更新), 不联网去问远端。
@@ -64,31 +65,32 @@ func newVersion(versionPrefixPath string, release bool) (string, error) {
 		return "", fmt.Errorf("%s 是空的, 里面应该是版本号前缀, 例 v0.1", versionPrefixPath)
 	}
 	gitDir := filepath.Dir(versionPrefixPath)
-	revCmd := exec.Command("git", "rev-parse", "HEAD")
-	revCmd.Dir = gitDir
-	out, err := revCmd.Output()
+	out, err := runGit(gitDir, "rev-parse", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("取 git commitId 失败 (%s 不在 git 仓库里?): %w", gitDir, err)
+		return "", fmt.Errorf("取 git commitId 失败: %w", err)
 	}
-	commitId := strings.TrimSpace(string(out))
-	stCmd := exec.Command("git", "status", "--porcelain")
-	stCmd.Dir = gitDir
-	st, err := stCmd.Output()
+	commitId := strings.TrimSpace(out)
+	// ★前缀文件本身必须被 git 跟踪: git status 不报被 ignore 的文件, 被 ignore 时照样会出 -r;
+	// 放在没有 .git 的被 ignore 子目录里时, git 往上找到的是外层仓库, commitId 也是外层的。
+	// --literal-pathspecs: 文件名按字面匹配, 否则 "v[ab].txt" 会被当通配模式, 匹配到别的已跟踪文件就误放过。
+	_, err = runGit(gitDir, "--literal-pathspecs", "ls-files", "--error-unmatch", "--", filepath.Base(versionPrefixPath))
+	if err != nil {
+		return "", fmt.Errorf("%s 没被 git 跟踪 (没 git add, 或被 .gitignore 掉了), 版本号前缀必须提交进 git: %w", versionPrefixPath, err)
+	}
+	st, err := runGit(gitDir, "status", "--porcelain")
 	if err != nil {
 		return "", fmt.Errorf("取 git status 失败: %w", err)
 	}
-	dirty := strings.TrimSpace(string(st)) != ""
+	dirty := strings.TrimSpace(st) != ""
 	if release {
 		if dirty {
 			return "", fmt.Errorf("正式发布要求工作区干净, 但 %s 所在仓库有未提交的修改 (git status --porcelain):\n%s", gitDir, st)
 		}
-		brCmd := exec.Command("git", "branch", "-r", "--contains", commitId)
-		brCmd.Dir = gitDir
-		br, err := brCmd.Output()
+		br, err := runGit(gitDir, "branch", "-r", "--contains", commitId)
 		if err != nil {
-			return "", fmt.Errorf("查 HEAD 有没有推送失败 (git branch -r --contains): %w", err)
+			return "", fmt.Errorf("查 HEAD 有没有推送失败: %w", err)
 		}
-		if strings.TrimSpace(string(br)) == "" {
+		if strings.TrimSpace(br) == "" {
 			return "", fmt.Errorf("正式发布要求 HEAD (%s) 已推送到远端, 但没有任何远端跟踪分支包含它: 先 git push", commitId)
 		}
 	}
@@ -100,4 +102,19 @@ func newVersion(versionPrefixPath string, release bool) (string, error) {
 			version, versionPrefixPath)
 	}
 	return version, nil
+}
+
+// runGit 在 dir 里跑一条 git 命令, 返回 stdout。
+// ★失败时把 git 的 stderr 带进 error: 只有 exit status 128 看不出原因
+// (不在仓库里 / dubious ownership (safe.directory) / 空仓库没有 HEAD 都是 128)。
+func runGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("在 %s 跑 git %s 失败: %w: %s", dir, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return string(out), nil
 }

@@ -15,7 +15,7 @@ import (
 // 小程序放在系统临时目录, 自带 go.mod 用 replace 指回本 module:
 // 不往本 module 目录里写东西 (从只读的 module cache 里跑 go test 也行), import path 也不写死 (fork 之后照样对)。
 func TestGetVersionVarFullName(t *testing.T) {
-	const ver = "v0.1.260901140715-8d8358905d.r"
+	const ver = "v0.1.260901140715-a1b2c3d4e5-r"
 	pkgPath := strings.TrimSuffix(GetVersionVarFullName(), ".GVersion")
 	modPath := strings.TrimSuffix(pkgPath, "/hgmBuildVersionCurrent")
 	if modPath == pkgPath {

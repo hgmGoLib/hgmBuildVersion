@@ -12,10 +12,10 @@ import "github.com/hgmGoLib/hgmBuildVersion/hgmBuildVersionCurrent" // 把版本
 A tiny, dependency-free Go library for build version strings like
 
 ```
-v0.1.260909155041-8d8358905d.r
+v0.1.260909155041-a1b2c3d4e5-r
 ```
 
-= `<prefix from versionPrefix.txt>.<build time YYMMDDhhmmss>-<first 10 hex of git HEAD>.<r=clean | d=dirty>`.
+= `<prefix from versionPrefix.txt>.<build time YYMMDDhhmmss>-<first 10 hex of git HEAD>-<r=clean | d=dirty>`.
 
 Versions for built binaries: every build gets a new version automatically, with no human step and no change to the git repo (no "bump version file, commit, build again" round trip); nothing but the git repo and the build machine is involved, no central version service. Order = prefix (edited by hand) + build time. The commit id lets you find the exact source of a running binary.
 
@@ -44,7 +44,7 @@ Treat a version as an opaque string: pass it around, compare with `==`, hand it 
 
 典型用途:
 
-- **拿着版本号找到编译时的源代码**: 版本号里带着打包时 git HEAD 的 commitId, 线上跑着的二进制报出版本号, `git checkout <commitId>` 就是它的代码。末尾是 `.d` 的包打包时有未提交的修改, 只能找到最接近的那个 commit; commit 没推送到共享仓库时别人也找不到。
+- **拿着版本号找到编译时的源代码**: 版本号里带着打包时 git HEAD 的 commitId, 线上跑着的二进制报出版本号, `git checkout <commitId>` 就是它的代码。末尾是 `-d` 的包打包时有未提交的修改, 只能找到最接近的那个 commit; commit 没推送到共享仓库时别人也找不到。
 - 程序自更新时判断 "要不要换成下载到的那个版本"。
 - 按版本号建目录存放各版本的二进制。
 - 日志 / 接口里上报自己的版本。
@@ -52,14 +52,14 @@ Treat a version as an opaque string: pass it around, compare with `==`, hand it 
 版本号形如:
 
 ```
-v0.1.260909155041-8d8358905d.r
+v0.1.260909155041-a1b2c3d4e5-r
 ```
 
 | 段 | 含义 |
 |---|---|
 | `v0.1` | 前缀, 来自仓库里的 `versionPrefix.txt` (人手改, 大版本才动) |
 | `260909155041` | 打包时间 YYMMDDhhmmss (定长 12 位; 时区由 `GBuildTimeZoneOffsetSecond` 定, 默认 UTC+8) |
-| `8d8358905d` | 打包时 git HEAD 的 commitId 前 10 位 |
+| `a1b2c3d4e5` | 打包时 git HEAD 的 commitId 前 10 位 |
 | `r` / `d` | 打包时工作区干净 / 有未提交修改 (未被 .gitignore 的未跟踪文件也算) |
 
 - **比大小只看前三段** (`v0.1` 和时间戳)。
@@ -87,8 +87,8 @@ cmd := exec.Command("go", "build",
 	"-o", "bin/xxx", "./xxx")
 ```
 
-工作区有未提交修改时照样能打, 只是末尾变成 `.d`。`versionPrefix.txt` 写错时 `NewBuildVersion` 直接返回 error。
-没有 git (例如从源码压缩包构建) 或该文件不在 git 仓库里时也直接返回 error。
+工作区有未提交修改时照样能打, 只是末尾变成 `-d`。`versionPrefix.txt` 写错时 `NewBuildVersion` 直接返回 error。
+没有 git (例如从源码压缩包构建) 或该文件没被 git 跟踪 (没 `git add` / 被 .gitignore 掉) 时也直接返回 error。
 
 **时区一个项目定一次, 之后不要改**: 时区不写进版本号, 而时间戳决定新旧; 比如从 UTC+8 改成 UTC, 改完后 8 小时内打的包比改之前的"旧", 不算升级。非改不可时同时升 `versionPrefix.txt` 的版本号顶过去。
 
@@ -124,3 +124,4 @@ commitId, ok := hgmBuildVersion.GetCommitId(ver) // 10 位小写 hex; 非法版�
 
 实战用法 (自更新怎么写 / 版本号显示在哪 / 升级的真机自动测试 / GitHub 发布) 见 [doc/usage.md](doc/usage.md)。
 设计取舍见 [doc/design.md](doc/design.md) 和 [doc/binaryAndLibVersion.md](doc/binaryAndLibVersion.md)。
+改版本号格式 / 从别的版本号格式迁过来 (已部署的旧二进制怎么升上来) 见 [doc/formatMigration.md](doc/formatMigration.md)。

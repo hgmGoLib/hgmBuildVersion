@@ -21,10 +21,12 @@ exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionV
 
 ### 2. 包里放什么
 
-- zip 文件名和 zip 里的顶层目录都带版本号整串, 例 `myApp-v0.1.260909155041-8d8358905d.r.zip`。
+- zip 文件名和 zip 里的顶层目录都带版本号整串, 例 `myApp-v0.1.260909155041-a1b2c3d4e5-r.zip`。
   文件名只给人看, 程序不从文件名里取版本号。
 - zip 里放一个固定文件 `version.txt`, 内容就是版本号整串 (一行, 和 `version` 子命令的输出一样)。
-  ★程序要知道"这个 zip 是哪个版本"时, 一律读它, 不解析文件名: 读出来 -> `IsValid` -> 拿去比新旧 / `GetCommitId` 找源码。
+  ★程序要知道"这个 zip 是哪个版本"时, 一律读它, 不解析文件名: 读出来 -> `strings.TrimSpace` -> `IsValid` -> 拿去比新旧 / `GetCommitId` 找源码。
+  ★`IsValid` 不 trim (带 `\n` / `\r\n` 一律判 false, 于是 `IsUpgrade` 也是 false): 忘了 trim 的表现是"静默永不升级"。
+  `IsValid` 为 false 时要打日志带上原串, 不要静默跳过。
 - 如果有中心服务负责分发, 它的配置里写"当前发布版本 = 这个 ver", 由安装包自己带过去, 不让人手填。
 
 ### 3. 正式发布用 `NewReleaseVersion`
@@ -33,7 +35,7 @@ exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionV
 ver, err := hgmBuildVersion.NewReleaseVersion("versionPrefix.txt")
 ```
 
-工作区不干净 (结果会是 `.d`)、或者 HEAD 还没推送到远端时直接返回 error。这样发出去的每个包, 拿着版本号一定找得到准确的源码
+工作区不干净 (结果会是 `-d`)、或者 HEAD 还没推送到远端时直接返回 error。这样发出去的每个包, 拿着版本号一定找得到准确的源码
 (有 git 子模块时不完全成立, 见 [design.md](design.md) 的"已知限制")。
 开发测试打包继续用 `NewBuildVersion` (脏工作区照样打)。
 
@@ -145,7 +147,7 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 测试里只写死一个常量, 每次发版之后改成新的线上版本:
 
 ```go
-const oldVersion = "v0.1.261001101926-e0ba4f37f7.r" // 线上机器自报的那一串 (或者旧 zip 里 version.txt 的内容)
+const oldVersion = "v0.1.261001101926-f0e1d2c3b4-r" // 线上机器自报的那一串 (或者旧 zip 里 version.txt 的内容)
 oldCommit, ok := hgmBuildVersion.GetCommitId(oldVersion) // 不要另抄一份 commitId 常量
 ```
 
@@ -159,7 +161,7 @@ oldCommit, ok := hgmBuildVersion.GetCommitId(oldVersion) // 不要另抄一份 c
      不用 `git worktree add`: 那样子模块是空目录。
   2. 在旧代码树里跑旧代码自己的代码生成 / 构建工具。
   3. 版本号【直接注入 `oldVersion` 原串】(`-X ...=oldVersion`), 不要在旧代码树里调 `NewBuildVersion`:
-     archive 出来的目录没有 `.git`, git 会一路往上找到外面的新仓库, 编出来的"旧版本"自报的是新 commit 和现在的时间。
+     archive 出来的目录没有 `.git`, 取不到当年的 commitId (前缀文件不被 git 跟踪, `NewBuildVersion` 直接返回 error); 就算取到了, 时间戳也是现在的时间, 不是当年那一串。
      注入原串之后, 编出来的旧包和线上那一版的版本号完全一样。
   4. 旧代码树按 commit 缓存在临时目录里 (同一个 commit 的代码不会变), 不必每次重新解压和生成。
 

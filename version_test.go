@@ -24,9 +24,9 @@ func testEqual(t *testing.T, got interface{}, want interface{}) {
 
 // 本文件里反复用到的几个合法版本号。
 const (
-	verA    = "v0.1.260901140715-8d8358905d.r" // 基准
-	verANew = "v0.1.260901140716-8d8358905d.r" // 只比 verA 晚一秒
-	verADup = "v0.1.260901140715-ffffffffff.d" // 与 verA 【序相同身份不同】
+	verA    = "v0.1.260901140715-a1b2c3d4e5-r" // 基准
+	verANew = "v0.1.260901140716-a1b2c3d4e5-r" // 只比 verA 晚一秒
+	verADup = "v0.1.260901140715-ffffffffff-d" // 与 verA 【序相同身份不同】
 )
 
 // 【序】= 前三段 uint64 从前往后比: 前面的段不同就以它定胜负, 相等才看下一段; 序全等 = 同版本, 不升。
@@ -37,14 +37,14 @@ func TestIsUpgradeComparesOrderOnly(t *testing.T) {
 	testEqual(t, IsUpgrade(verA, verA), false)    // 同版本不升
 
 	// 前两段 (versionPrefix.txt) 优先级更高: 段1 更大就算更新, 哪怕时间戳更早。
-	testEqual(t, IsUpgrade("v0.9.269999999999-aaaaaaaaaa.r", "v1.0.260101000000-bbbbbbbbbb.r"), true)
-	testEqual(t, IsUpgrade("v1.0.260101000000-bbbbbbbbbb.r", "v0.9.269999999999-aaaaaaaaaa.r"), false)
+	testEqual(t, IsUpgrade("v0.9.269999999999-aaaaaaaaaa-r", "v1.0.260101000000-bbbbbbbbbb-r"), true)
+	testEqual(t, IsUpgrade("v1.0.260101000000-bbbbbbbbbb-r", "v0.9.269999999999-aaaaaaaaaa-r"), false)
 	// 段1 相等则看段2。
-	testEqual(t, IsUpgrade(verA, "v0.2.260101000000-aaaaaaaaaa.r"), true)
-	testEqual(t, IsUpgrade("v0.2.260101000000-aaaaaaaaaa.r", "v0.1.269999999999-aaaaaaaaaa.r"), false)
+	testEqual(t, IsUpgrade(verA, "v0.2.260101000000-aaaaaaaaaa-r"), true)
+	testEqual(t, IsUpgrade("v0.2.260101000000-aaaaaaaaaa-r", "v0.1.269999999999-aaaaaaaaaa-r"), false)
 
 	// 不是按字符串比: "10" > "9" 在数字上成立, 在字典序上不成立。
-	testEqual(t, IsUpgrade("v0.9.260901140715-aaaaaaaaaa.r", "v0.10.260901140715-aaaaaaaaaa.r"), true)
+	testEqual(t, IsUpgrade("v0.9.260901140715-aaaaaaaaaa-r", "v0.10.260901140715-aaaaaaaaaa-r"), true)
 }
 
 // ★后两段 (commitId / 脏否) 【不参与比大小】—— 这正是把它们放在序后面的意义。
@@ -69,29 +69,31 @@ func TestIsUpgradeRefusesMalformed(t *testing.T) {
 		"v0.1.", "v.1.2", // 空段
 		"v0.1.26090114071a", "v0.1. 260901140715", "v0.1.+260901140715", // 序里有非数字
 		"v0.1.26090114071", "v0.1.2609011407150", // 时间戳不是 12 位
-		"v0.01.260901140715-8d8358905d.r", // 段2 前导零 (同一版本会有两种写法)
-		"v0.99999999999999999999999.260901140715-8d8358905d.r", // 段2 溢出 uint64
-		"0.1.260901140715-8d8358905d.r",                        // 少了 v
+		"v0.01.260901140715-a1b2c3d4e5-r", // 段2 前导零 (同一版本会有两种写法)
+		"v0.99999999999999999999999.260901140715-a1b2c3d4e5-r", // 段2 溢出 uint64
+		"0.1.260901140715-a1b2c3d4e5-r",                        // 少了 v
 
-		// ── 身份后缀那半: 恰好 <10位小写hex>.<r|d>, 差一点都不行 ──
+		// ── 身份后缀那半: 恰好 <10位小写hex>-<r|d>, 差一点都不行 ──
 		"v0.1.260901140715-",               // 后缀为空
-		"v0.1.260901140715-8d8358905d",     // 少了脏否那段
-		"v0.1.260901140715-8d8358905d.",    // 脏否为空
-		"v0.1.260901140715-8d8358905d.x",   // 脏否不是 r/d
-		"v0.1.260901140715-8d8358905d.rd",  // 脏否多一个字符
-		"v0.1.260901140715-8d8358905.r",    // commitId 只有 9 位
-		"v0.1.260901140715-8d8358905dd.r",  // commitId 11 位
-		"v0.1.260901140715-8D8358905D.r",   // commitId 大写 (只认小写 hex, 免得同一个包两种写法)
-		"v0.1.260901140715-8d8358905g.r",   // commitId 不是 hex
-		"v0.1.260901140715-8d8358905d.r.d", // 后缀三段
+		"v0.1.260901140715-a1b2c3d4e5",     // 少了脏否那段
+		"v0.1.260901140715-a1b2c3d4e5-",    // 脏否为空
+		"v0.1.260901140715-a1b2c3d4e5-x",   // 脏否不是 r/d
+		"v0.1.260901140715-a1b2c3d4e5-rd",  // 脏否多一个字符
+		"v0.1.260901140715-a1b2c3d4e-r",    // commitId 只有 9 位
+		"v0.1.260901140715-a1b2c3d4e5d-r",  // commitId 11 位
+		"v0.1.260901140715-A1B2C3D4E5-r",   // commitId 大写 (只认小写 hex, 免得同一个包两种写法)
+		"v0.1.260901140715-a1b2c3d4eg-r",   // commitId 不是 hex
+		"v0.1.260901140715-a1b2c3d4e5-r-d", // 后缀三段
+		"v0.1.260901140715-a1b2c3d4e5.r",   // 旧格式 (commitId 和脏否之间是 '.'): 本库只认当前格式, 见 doc/formatMigration.md
 
 		// ── 拿去当路径片段的危险形态: 必须一个都进不来 ──
 		"../../etc", "v0/1/2", "v0.1.26/../..",
 		"v0.1.260901140715-..",
-		"v0.1.260901140715-8d8358905d..r", // 空段 (".." 的来源)
-		"v0.1.260901140715-../etc/pw.r",
-		"v0.1.260901140715-8d8358905d.r/x",
-		"v0.1.260901140715-8d8358905d.r\x00", // 尾部有 NUL
+		"v0.1.260901140715-a1b2c3d4e5--r",
+		"v0.1.260901140715-a1b2c3d4e5-..",
+		"v0.1.260901140715-../etc/pw-r",
+		"v0.1.260901140715-a1b2c3d4e5-r/x",
+		"v0.1.260901140715-a1b2c3d4e5-r\x00", // 尾部有 NUL
 	} {
 		testOk(t, !IsValid(bad), "应判非法: "+bad)
 		testOk(t, !IsUpgrade(verA, bad), "非法目标版本不许升: "+bad)
@@ -104,11 +106,15 @@ func TestIsUpgradeRefusesMalformed(t *testing.T) {
 func TestGetCommitId(t *testing.T) {
 	id, ok := GetCommitId(verA)
 	testOk(t, ok, "合法版本号应取得出 commitId")
-	testEqual(t, id, "8d8358905d")
+	testEqual(t, id, "a1b2c3d4e5")
 	id, ok = GetCommitId(verADup)
 	testOk(t, ok, "合法版本号应取得出 commitId")
 	testEqual(t, id, "ffffffffff")
-	for _, bad := range []string{"", "dev", "v0.1.260901140715-8d8358905d", "v0.1.260901140715-../etc/pw.r"} {
+	// commitId 全是数字且以 0 开头: 照样合法 (换成 '-' 分隔就是为了它, 见 validVersionSuffix)。
+	id, ok = GetCommitId("v0.1.260901140715-0123456789-r")
+	testOk(t, ok, "全数字 commitId 应判合法")
+	testEqual(t, id, "0123456789")
+	for _, bad := range []string{"", "dev", "v0.1.260901140715-a1b2c3d4e5", "v0.1.260901140715-../etc/pw-r"} {
 		id, ok = GetCommitId(bad)
 		testOk(t, !ok && id == "", "非法版本号不应取出 commitId: "+bad)
 	}
@@ -117,16 +123,16 @@ func TestGetCommitId(t *testing.T) {
 // makeVersion 是格式的生成侧真源: 拼出来的东西必须能被本文件的解析侧原样收回去。
 func TestMakeVersion(t *testing.T) {
 	// 完整 sha 自动截前 10 位。
-	testEqual(t, makeVersion("v0.1", "260901140715", "8d8358905d1234567890abcdef", false), verA)
-	testEqual(t, makeVersion("v0.1", "260901140715", "8d8358905d", false), verA)
-	// 脏了 -> .d
-	testEqual(t, makeVersion("v0.1", "260901140715", "8d8358905d", true), "v0.1.260901140715-8d8358905d.d")
-	testOk(t, IsValid(makeVersion("v0.1", "260901140715", "8d8358905d", true)), "拼出来的应当自洽")
+	testEqual(t, makeVersion("v0.1", "260901140715", "a1b2c3d4e51234567890abcdef", false), verA)
+	testEqual(t, makeVersion("v0.1", "260901140715", "a1b2c3d4e5", false), verA)
+	// 脏了 -> -d
+	testEqual(t, makeVersion("v0.1", "260901140715", "a1b2c3d4e5", true), "v0.1.260901140715-a1b2c3d4e5-d")
+	testOk(t, IsValid(makeVersion("v0.1", "260901140715", "a1b2c3d4e5", true)), "拼出来的应当自洽")
 
 	// 前缀写错 -> 拼出来判非法 (打包口据此当场炸, 而不是等到部署后升不了级)。
-	testOk(t, !IsValid(makeVersion("0.1", "260901140715", "8d8358905d", false)), "少了 v 应判非法")
-	testOk(t, !IsValid(makeVersion("v0.1.2", "260901140715", "8d8358905d", false)), "前缀三段应判非法")
-	testOk(t, !IsValid(makeVersion("vx", "260901140715", "8d8358905d", false)), "前缀带字母应判非法")
+	testOk(t, !IsValid(makeVersion("0.1", "260901140715", "a1b2c3d4e5", false)), "少了 v 应判非法")
+	testOk(t, !IsValid(makeVersion("v0.1.2", "260901140715", "a1b2c3d4e5", false)), "前缀三段应判非法")
+	testOk(t, !IsValid(makeVersion("vx", "260901140715", "a1b2c3d4e5", false)), "前缀带字母应判非法")
 }
 
 // ★字符集: 合法版本号里只能出现 RFC 3986 的 unreserved character。

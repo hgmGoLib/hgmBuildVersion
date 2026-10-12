@@ -1,5 +1,5 @@
 // Package hgmBuildVersion generates, validates and compares build version strings
-// like "v0.1.260909155041-8d8358905d.r" (prefix + build timestamp + git commit + clean/dirty flag).
+// like "v0.1.260909155041-a1b2c3d4e5-r" (prefix + build timestamp + git commit + clean/dirty flag).
 //
 // 二进制版本号: 生成 (NewBuildVersion) / 校验 (IsValid) / 比大小 (IsUpgrade)。
 // 把版本号烤进二进制、运行期读出来见子包 hgmBuildVersionCurrent。
@@ -7,13 +7,13 @@ package hgmBuildVersion
 
 // version.go — 版本号的格式: 生成侧 (makeVersion) + 解析侧 (IsValid / IsUpgrade) 同住一个文件。
 //
-// 形态: v<段1>.<段2>.<时间戳>-<commitId10>.<r|d>
+// 形态: v<段1>.<段2>.<时间戳>-<commitId10>-<r|d>
 //
-//	例  v0.1.260909155041-8d8358905d.r
+//	例  v0.1.260909155041-a1b2c3d4e5-r
 //
 //	v0.1            前缀, 存在 git 里的 versionPrefix.txt (人手改, 大版本才动)
 //	260909155041    打包那一刻的时间 YYMMDDhhmmss (定长 12 位; 时区见 GBuildTimeZoneOffsetSecond, 默认 UTC+8)
-//	8d8358905d      打包时 HEAD 的 commitId 前 10 位 (小写 hex) —— 拿着它就能找到代码
+//	a1b2c3d4e5      打包时 HEAD 的 commitId 前 10 位 (小写 hex) —— 拿着它就能找到代码
 //	r / d           打包时工作区干净(r=release)还是有未提交的修改(d=dirty)
 //
 // ★版本号对调用方是【不透明字符串】: 只能原样传递、判等 ==、交给本包的函数。
@@ -68,7 +68,7 @@ func makeVersion(prefix string, stamp string, commitId string, dirty bool) strin
 	if len(commitId) > versionCommitIdLen {
 		commitId = commitId[:versionCommitIdLen]
 	}
-	return prefix + "." + stamp + "-" + commitId + "." + flag
+	return prefix + "." + stamp + "-" + commitId + "-" + flag
 }
 
 // IsValid 版本号格式合法吗。
@@ -76,7 +76,7 @@ func makeVersion(prefix string, stamp string, commitId string, dirty bool) strin
 // ★凡是把版本号当【路径片段】用的地方必须先过它:
 // 版本号可能从外部收进来, 不校验就等于让对端往任意路径读写。
 //
-// 格式被【整串锁死】: v<数字>.<数字>.<12位数字>-<10位小写hex>.<r|d>。
+// 格式被【整串锁死】: v<数字>.<数字>.<12位数字>-<10位小写hex>-<r|d>。
 // 长度和字符集全定死之后 ".." 和 "/" 在语法上就不可能出现 —— 路径穿越那条线是被格式本身关掉的,
 // 不是靠某个调用方记得过滤。
 func IsValid(version string) bool {
@@ -112,19 +112,19 @@ func IsUpgrade(cur string, target string) bool {
 //
 // ★只许拿去找源码。不许参与任何判断 (比新旧 / 判是不是同一个包 / 判干净还是脏):
 // 比新旧用 IsUpgrade, 判是不是同一个包用整串 ==。
-// 末尾是 .d 的包打包时有未提交的修改, 这个 commit 只是最接近的那份代码。
+// 末尾是 -d 的包打包时有未提交的修改, 这个 commit 只是最接近的那份代码。
 func GetCommitId(version string) (string, bool) {
 	if !IsValid(version) {
 		return "", false
 	}
-	// 合法版本号的后缀恰好是 -<10位commitId>.<r|d>, 第一个 '-' 之后就是 commitId。
+	// 合法版本号的后缀恰好是 -<10位commitId>-<r|d>, 第一个 '-' 之后就是 commitId。
 	dashIdx := strings.IndexByte(version, '-')
 	return version[dashIdx+1 : dashIdx+1+versionCommitIdLen], true
 }
 
 // orderParts 校验整串, 并把【序】拆成三段 uint64。格式不对 -> ok=false。
 //
-//	"v0.1.260909155041-8d8358905d.r" -> ([0, 1, 260909155041], true)
+//	"v0.1.260909155041-a1b2c3d4e5-r" -> ([0, 1, 260909155041], true)
 //
 // 自己解析而不用 strconv.ParseUint: 要顺便挡掉 "+1" / "-1" / " 1" / "0x10" 这些花样。
 func orderParts(version string) ([versionOrderPartCount]uint64, bool) {
@@ -177,16 +177,20 @@ func orderParts(version string) ([versionOrderPartCount]uint64, bool) {
 	return out, true
 }
 
-// validVersionSuffix 校验【身份后缀】那半: <10位小写hex>.<r|d>。
+// validVersionSuffix 校验【身份后缀】那半: <10位小写hex>-<r|d>。
 //
 // ★这里是整串锁死的关键一半: 恰好两段、每段定长、字符集白名单。
-// 于是 ".." (空段) 和 "/" 在语法上都进不来 —— 版本号能当目录名用靠的就是这个。
+// 于是 "." 和 "/" 在语法上都进不来 —— 版本号能当目录名用靠的就是这个。
+//
+// ★commitId 和脏否之间用 '-' 不用 '.': semver 的预发布段按 '.' 切标识符, 全数字的标识符不许前导零。
+// 用 '.' 时 commitId 碰巧全是数字且以 0 开头 (约千分之一) 就不是合法 semver;
+// 用 '-' 时整个后缀是【一个】含 '-' 的标识符, 永远不是数字型, 任何 commitId 都合法 (Go 伪版本同理)。
 func validVersionSuffix(s string) bool {
-	dotIdx := strings.IndexByte(s, '.')
-	if dotIdx < 0 {
+	dashIdx := strings.IndexByte(s, '-')
+	if dashIdx < 0 {
 		return false
 	}
-	commitId, flag := s[:dotIdx], s[dotIdx+1:]
+	commitId, flag := s[:dashIdx], s[dashIdx+1:]
 	if len(commitId) != versionCommitIdLen {
 		return false
 	}
