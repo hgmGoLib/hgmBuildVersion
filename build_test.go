@@ -1,6 +1,6 @@
 package hgmBuildVersion
 
-// build_test.go — NewBuildVersion / NewReleaseVersion: 在系统临时目录真建 git 仓库来跑 (需要本机有 git)。
+// build_test.go — NewBuildVersion: 在系统临时目录真建 git 仓库来跑 (需要本机有 git)。
 
 import (
 	"io/ioutil"
@@ -121,15 +121,8 @@ func TestNewBuildVersionUntrackedPrefix(t *testing.T) {
 	testOk(t, os.Remove(globPath) == nil, "remove v[ab].txt") // 下面要求工作区干净
 	r.CommitId = r.Git("rev-parse", "HEAD")[:versionCommitIdLen]
 
-	remoteDir := filepath.Join(r.Dir, "sub", "remote.git")
-	r.Git("init", "-q", "--bare", remoteDir)
-	r.Git("remote", "add", "origin", remoteDir)
-	r.Git("push", "-q", "origin", "HEAD:refs/heads/main")
-	_, err = NewReleaseVersion(subPath)
-	testOk(t, err != nil, "干净且已推送时, 被 ignore 子目录里的前缀文件也应返回 error")
-
 	// 对照: 仓库里正经提交的那份照常出 -r
-	ver, err := NewReleaseVersion(r.PrefixPath)
+	ver, err := NewBuildVersion(r.PrefixPath)
 	testOk(t, err == nil && strings.HasSuffix(ver, "-"+r.CommitId+"-r"), "被跟踪的前缀文件应正常出 -r: "+ver)
 }
 
@@ -148,40 +141,4 @@ func TestNewBuildVersionGitStderr(t *testing.T) {
 	_, err = NewBuildVersion(prefixPath)
 	testOk(t, err != nil, "不在 git 仓库里应返回 error")
 	testOk(t, strings.Contains(err.Error(), "not a git repository"), "error 里应带 git 的 stderr: "+err.Error())
-}
-
-// NewReleaseVersion: 没推送 -> error; 推送了但工作区脏 -> error; 干净且已推送 -> -r 版本号。
-func TestNewReleaseVersion(t *testing.T) {
-	r := newTestGitRepo(t)
-	defer os.RemoveAll(r.Dir)
-
-	_, err := NewReleaseVersion(r.PrefixPath)
-	testOk(t, err != nil, "没有远端 (HEAD 没推送) 应返回 error")
-
-	// 真建一个本地 bare 仓库当远端, 推上去 (推送会顺带更新 refs/remotes/origin/main)。
-	remoteDir := filepath.Join(r.Dir, "remote.git")
-	r.Git("init", "-q", "--bare", remoteDir)
-	r.Git("remote", "add", "origin", remoteDir)
-	// remote.git 在工作区里, 本身就会让工作区变脏: 让 git 忽略它。
-	testOk(t, ioutil.WriteFile(filepath.Join(r.Dir, ".git", "info", "exclude"), []byte("/remote.git/\n"), 0644) == nil, "write exclude")
-	r.Git("push", "-q", "origin", "HEAD:refs/heads/main")
-
-	ver, err := NewReleaseVersion(r.PrefixPath)
-	testOk(t, err == nil, "干净且已推送应成功")
-	testOk(t, IsValid(ver) && strings.HasSuffix(ver, "-"+r.CommitId+"-r"), "应是 -r 版本号: "+ver)
-
-	// 本地新提交一个没推送的 commit -> error
-	testOk(t, ioutil.WriteFile(filepath.Join(r.Dir, "a.txt"), []byte("a"), 0644) == nil, "write a.txt")
-	r.Git("add", "a.txt")
-	r.Git("commit", "-q", "-m", "local only")
-	_, err = NewReleaseVersion(r.PrefixPath)
-	testOk(t, err != nil, "HEAD 没推送应返回 error")
-	r.Git("push", "-q", "origin", "HEAD:refs/heads/main")
-
-	// 已推送但工作区脏 -> error; NewBuildVersion 照样能打 (-d)
-	testOk(t, ioutil.WriteFile(filepath.Join(r.Dir, "untracked.txt"), []byte("x"), 0644) == nil, "write untracked")
-	_, err = NewReleaseVersion(r.PrefixPath)
-	testOk(t, err != nil, "工作区脏应返回 error")
-	ver, err = NewBuildVersion(r.PrefixPath)
-	testOk(t, err == nil && strings.HasSuffix(ver, "-d"), "NewBuildVersion 脏工作区应照样打出 -d: "+ver)
 }

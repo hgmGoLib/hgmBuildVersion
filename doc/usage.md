@@ -1,14 +1,14 @@
 # hgmBuildVersion 实战用法
 
-API 见 `../readme.md`。这里写的是"一个会自更新的程序, 版本号相关的事情具体怎么做", 都是在实际项目里跑通过的做法
-(多平台 agent + 一个中心服务, agent 由中心推送自更新; 真机 linux + windows 自动测试)。照着做就行, 不用再自己做决策。
+API 见 `../readme.md`。这里写的是"一个会自更新的程序, 版本号相关的事情具体怎么做"。
+下文以这种结构为例: 一个中心服务 + 装在多台机器上的客户端, 客户端由中心推送自更新; 升级流程有真机自动测试。照着做就行, 不用再自己做决策。
 
 ## 一、打包侧
 
 ### 1. 一次打包只生成一次版本号
 
 ```go
-ver, err := hgmBuildVersion.NewBuildVersion("versionPrefix.txt") // 正式发布用 NewReleaseVersion, 见下
+ver, err := hgmBuildVersion.NewBuildVersion("versionPrefix.txt")
 // 每个平台 / 每个二进制都用这同一个 ver:
 exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionVarFullName()+"="+ver, "-o", out, pkg)
 ```
@@ -18,6 +18,7 @@ exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionV
 - 打包工具【不提供】`-Version` 参数。"升一版" = 再打一次包 (再生成一次)。
   唯一的例外是第四节"重新编一个旧版本": 那时注入的是【当年记录下来的那个版本号原串】, 不是人手编一个。
 - 不要在版本号上做算术 / 拼接 / 推算下一个版本, 也不要自己拆它。只能原样传递、`==` 判等、交给本库。
+  正式打包不挪时间戳。升级的自动测试里同一秒连打几个包时, 用 `AddTimeSecond` 拉开序 (见第四节), 不要自己改数字。
 
 ### 2. 包里放什么
 
@@ -28,18 +29,6 @@ exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionV
   ★`IsValid` 不 trim (带 `\n` / `\r\n` 一律判 false, 于是 `IsUpgrade` 也是 false): 忘了 trim 的表现是"静默永不升级"。
   `IsValid` 为 false 时要打日志带上原串, 不要静默跳过。
 - 如果有中心服务负责分发, 它的配置里写"当前发布版本 = 这个 ver", 由安装包自己带过去, 不让人手填。
-
-### 3. 正式发布用 `NewReleaseVersion`
-
-```go
-ver, err := hgmBuildVersion.NewReleaseVersion("versionPrefix.txt")
-```
-
-工作区不干净 (结果会是 `-d`)、或者 HEAD 还没推送到远端时直接返回 error。这样发出去的每个包, 拿着版本号一定找得到准确的源码
-(有 git 子模块时不完全成立, 见 [design.md](design.md) 的"已知限制")。
-开发测试打包继续用 `NewBuildVersion` (脏工作区照样打)。
-
-"已推送"看的是本地的远端跟踪分支 (`git branch -r --contains HEAD`), 不联网: 先 `git push`, 再打包。
 
 ## 二、运行侧
 
@@ -80,7 +69,7 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
   - 强制只跳过 `IsUpgrade`, 【不跳过 `IsValid`】: 版本号要当路径 / 嵌进脚本, 看不懂的版本号强制也不放行。
   - 强制降级只是暂时的: 中心的"最新版本"还是新的那个, 下一次自动触发就会把它升回去。
 - 想让【全场】回到旧代码: 不用强制。在 git 里 checkout 旧 commit (真正的 git 工作区, 不是 archive 出来的目录),
-  用 `NewReleaseVersion` 重新打一个包 —— 时间戳更新, 序更大, 旧代码走正常的自动升级通道下发到所有机器。
+  用 `NewBuildVersion` 重新打一个包 —— 时间戳更新, 序更大, 旧代码走正常的自动升级通道下发到所有机器。
 - 手动更新命令可以额外比文件内容 (大小 + MAC): 已经是那一版就一个字节都不传。
 
 ### 3. 版本号当路径 / 嵌进脚本: 入口处先过 `IsValid`
@@ -117,13 +106,17 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 | 客户端上报给中心的库存 | 每台机器的当前版本号 (来自二进制自身) |
 | 中心的查询接口 / 管理网页 | 中心自己的版本号 + 每台机器的版本号, 原样显示 |
 | 服务启动日志 / 自更新日志 | 启动时打一行自己的版本号; 自更新时打 "当前=.. 目标=.." |
+| 页面上显示的构建时间 | `GetBuildTime(版本号)`; 不另外注入一个构建时间变量 (两个来源迟早对不上) |
 
 线上出问题时: 从上面任何一处拿到版本号 -> `GetCommitId` (或者人眼看) 取出 commitId -> `git checkout <commitId>` 就是那份代码。
 
 ## 四、升级的真机自动测试
 
-两种测试都是全自动的, 不需要人改任何文件、提交任何东西。测试过程中只做"部署新版本的中心服务"这一个动作,
+这几种测试都是全自动的, 不需要人改任何文件、提交任何东西。测试过程中只做"部署新版本的中心服务"这一个动作,
 之后不对客户端做任何操作: 升级必须由客户端自己收到更新事件并完成, 测试只等结果。
+
+测试会在几秒内连着打好几个包, 常常落在同一秒 (序相等, 不算升级): 用 `AddTimeSecond` 把本次打出来的版本号挪开。
+这是 `AddTimeSecond` 唯一的用处, 正式打包不挪。
 
 ### 1. 同一份代码的升级测试 (常设, 每次都跑)
 
@@ -131,8 +124,15 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 这条断了的线上表现是"发了新版本, 所有机器一动不动, 没有任何报错", 单元测试够不着。
 
 1. `base := NewBuildVersion(..)`, 用它首装中心服务和客户端, 等所有客户端上线且版本号 `== base`。
-2. `next := NewBuildVersion(..)` (同一份代码再生成一次), 先断言 `IsUpgrade(base, next)`:
-   两次打包落在同一秒时它会失败, 这时测试应当直接报错, 而不是往下跑一个必然超时的等待。
+2. `next := NewBuildVersion(..)` (同一份代码再生成一次)。两次打包常常落在同一秒, 不挪的话 `next` 不算升级, 测试会跑一个必然超时的等待:
+
+   ```go
+   if !hgmBuildVersion.IsUpgrade(base, next) {
+       next, err = hgmBuildVersion.AddTimeSecond(next, 1) // next 在 base 之后打, 时间戳不会比 base 小, 加 1 秒就够
+   }
+   ```
+
+   挪完再断言一次 `IsUpgrade(base, next)`。要连着预先打好几个包 (base、next1、next2 ...) 时同理, 每个都挪到比上一个新。
 3. 用 `next` 重新部署中心服务。
 4. 不碰客户端, 等所有客户端上线且版本号 `== next` (给足时间, 例如 4 分钟; 超时即失败)。
 5. 断言升级的副作用: 身份没丢、配置没丢、升级不该重启的东西没被重启。
@@ -168,10 +168,36 @@ oldCommit, ok := hgmBuildVersion.GetCommitId(oldVersion) // 不要另抄一份 c
 流程:
 
 1. 新版本 `next := NewBuildVersion(..)`, 先断言 `IsUpgrade(oldVersion, next)`。
+   旧版本是刚打不久的 (例 刚发完版就跑这个测试, 或者旧包是另一台时钟偏快的机器打的) 时 `next` 可能不比它新, 这时把 `next` 往后挪过去:
+
+   ```go
+   if !hgmBuildVersion.IsUpgrade(oldVersion, next) {
+       oldTime, _ := hgmBuildVersion.GetBuildTime(oldVersion)
+       nextTime, _ := hgmBuildVersion.GetBuildTime(next)
+       next, err = hgmBuildVersion.AddTimeSecond(next, int64(oldTime.Sub(nextTime)/time.Second)+1)
+   }
+   ```
+
+   挪的是 `next` (本次打的包), 不是 `oldVersion`: 旧包的版本号必须是当年那一串原样。挪完照样断言 `IsUpgrade(oldVersion, next)`, 前缀不同时挪不过去。
 2. 清场, 用旧 zip / 旧代码装中心服务和客户端, 等所有客户端上线且版本号 `== oldVersion`。
 3. 用当前代码部署新版本的中心服务, 断言中心自报 `== next`。
 4. 不碰客户端, 等所有客户端版本号 `== next`。
 5. 断言: 身份 / 信任关系 / 配置 / 已有的服务进程在升级前后不变。
+
+### 3. 拒绝降级的测试
+
+要一个 "比已装版本严格更旧、但签名合法" 的包, 验证客户端会拒装。现在打出来的包永远比已装的新, 所以把本次打出来的版本号往前挪:
+
+```go
+ver, _ := hgmBuildVersion.NewBuildVersion("versionPrefix.txt")
+verTime, _ := hgmBuildVersion.GetBuildTime(ver)
+installedTime, _ := hgmBuildVersion.GetBuildTime(installed)
+older, err := hgmBuildVersion.AddTimeSecond(ver, -(int64(verTime.Sub(installedTime)/time.Second) + 1))
+// 断言 CompareOrder(older, installed) 是 (-1, true), 再用 older 打包、签名、推给客户端, 等它拒绝。
+```
+
+- 只用在测试里。生产上降级走人工卸载重装 (见二、2 节), 不造 "更旧" 的版本号; 正式打包也不挪时间戳。
+- 序相等的包 (同一个版本号重推) 也会被拒, 但那测的是 "同版本不升"; 这里测的是 "严格更旧不升", 两条都要有。
 
 ## 五、GitHub 发布线上包 (一个 zip)
 
@@ -179,9 +205,10 @@ oldCommit, ok := hgmBuildVersion.GetCommitId(oldVersion) // 不要另抄一份 c
 
 - **对外发布时, 人认为一个前缀才是一个版本**: 一个前缀 (`versionPrefix.txt` 的内容, 例 `v0.4`) 只往 GitHub 发布【一次】,
   一个 tag、一个 release、一个 zip。版本号后面的时间戳和 commitId 只用来找打包时间和源码, 不是给外部用户区分版本用的。
-- 下一次对外发布 = 先把 `versionPrefix.txt` 升一级 (例 `v0.5`) 并 commit + push, 再用 `NewReleaseVersion` 打包、发布。
+- 下一次对外发布 = 先把 `versionPrefix.txt` 升一级 (例 `v0.5`) 并 commit + push, 再在干净的工作区里用 `NewBuildVersion` 打包、发布。
+  版本号末尾必须是 `-r` (`-d` 的包有未提交的修改, 拿着版本号找不回准确的源码); 打包前确认 HEAD (含子模块) 都推送了, 否则别人找不到代码。
   同一个前缀下内部打的那些包 (时间戳不同) 只在内部分发 (第二节的中心推送), 不上 GitHub。
-- 正式打包 (`NewReleaseVersion`) 出来的 zip, 文件名带完整版本号, 作为这个 release 唯一的附件:
+- 正式打包出来的 zip, 文件名带完整版本号, 作为这个 release 唯一的附件:
 
   ```sh
   gh release create v0.4 --target "$commitId" --title v0.4 --notes "..." "bin/myApp-$ver.zip"

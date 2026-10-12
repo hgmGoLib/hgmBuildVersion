@@ -20,12 +20,15 @@ v0.1.260909155041-a1b2c3d4e5-r
 Versions for built binaries: every build gets a new version automatically, with no human step and no change to the git repo (no "bump version file, commit, build again" round trip); nothing but the git repo and the build machine is involved, no central version service. Order = prefix (edited by hand) + build time. The commit id lets you find the exact source of a running binary.
 
 - `NewBuildVersion(versionPrefixPath) (string, error)` — generate the version for one build (run once, share it across all binaries of that build). Needs `git`.
-- `NewReleaseVersion(versionPrefixPath) (string, error)` — same, but fails unless the work tree is clean and HEAD is pushed (contained in a remote-tracking branch). Use it for builds you ship.
 - `GetCommitId(ver) (string, bool)` — the 10-hex commit id inside a version, only for finding the source. Never use it in any decision.
+- `GetBuildTime(ver) (time.Time, bool)` — the build time inside a version, read with `GBuildTimeZoneOffsetSecond`. For display / records only.
+- `AddTimeSecond(ver, second int64) (string, error)` — shift the timestamp by `second` (may be negative) with real clock carry; prefix, commit id and flag unchanged. For upgrade tests that build several packages within the same second: shift the version you just built so it is newer (or older) than the other one. Normal builds do not need it.
 - `GBuildTimeZoneOffsetSecond` — fixed UTC offset (seconds) for the timestamp, default `8*3600` (UTC+8). Pick it once per project and never change it: the zone is not part of the version string, so changing it breaks the order.
 - `IsValid(ver) bool` — strict whole-string format check. A valid version contains only `[0-9a-zA-Z.-]` and can never contain `/` or `..`, so it is safe as a file/directory name after this check.
 - `IsUpgrade(cur, target) bool` — true only if `target` is strictly newer. Ordering uses only the prefix and timestamp; commit id and dirty flag are identity, not order. Invalid input (including `""`) → `false`.
+- `CompareOrder(a, b) (cmp int, ok bool)` — three-way order compare (-1 / 0 / 1) for sorting, max, `>=`. Invalid input → `ok=false`; always check `ok` first.
 - Sub package `hgmBuildVersionCurrent`: `go build -ldflags "-X "+GetVersionVarFullName()+"="+ver`, then `GetCurrentVersion()` at runtime.
+- `ts/hgmBuildVersion.ts` — TypeScript `IsValid` / `IsUpgrade` / `CompareOrder` for front ends, checked against the same `testdata/cases.json` as the Go code.
 
 Treat a version as an opaque string: pass it around, compare with `==`, hand it to this package.
 
@@ -64,7 +67,8 @@ v0.1.260909155041-a1b2c3d4e5-r
 
 - **比大小只看前三段** (`v0.1` 和时间戳)。
 - **判断是不是同一个包用整串 `==`**: 同一秒打的两个不同 commit 的包, 序相同但整串不同。
-- 版本号就是 `string`。调用方只能原样传递、判等 `==`、交给本包的函数; 不要自己拆它。唯一能从里面取的是 commitId (`GetCommitId`), 而且只许拿去找源码。
+- 版本号就是 `string`。调用方只能原样传递、判等 `==`、交给本包的函数; 不要自己拆它、改它。
+  能从里面取的只有 commitId (`GetCommitId`, 只许拿去找源码) 和打包时刻 (`GetBuildTime`, 只给人看 / 存档); 能改的只有时间戳 (`AddTimeSecond`)。
 
 ## 怎么用
 
@@ -92,8 +96,6 @@ cmd := exec.Command("go", "build",
 
 **时区一个项目定一次, 之后不要改**: 时区不写进版本号, 而时间戳决定新旧; 比如从 UTC+8 改成 UTC, 改完后 8 小时内打的包比改之前的"旧", 不算升级。非改不可时同时升 `versionPrefix.txt` 的版本号顶过去。
 
-正式发布 (发给别人 / 上线) 用 `NewReleaseVersion` 代替 `NewBuildVersion`: 工作区不干净、或者 HEAD 还没推送到远端时直接返回 error, 保证拿着版本号一定找得到源码。
-
 也可以不用 `-X`: 在程序开始的位置直接赋值 `hgmBuildVersionCurrent.GVersion = ver` (例如由生成代码写进 main 包)。
 
 ### 3. 运行期: 读出自己的版本
@@ -107,12 +109,16 @@ cur := hgmBuildVersionCurrent.GetCurrentVersion() // 原样返回注入的串; �
 ### 4. 校验 / 比大小
 
 ```go
-hgmBuildVersion.IsValid(ver) bool           // 空串 -> false
-hgmBuildVersion.IsUpgrade(cur, target) bool // target 严格更新才 true; 任一非法 (含空串) -> false
+hgmBuildVersion.IsValid(ver) bool                  // 空串 -> false
+hgmBuildVersion.IsUpgrade(cur, target) bool        // target 严格更新才 true; 任一非法 (含空串) -> false
+hgmBuildVersion.CompareOrder(a, b) (cmp int, ok bool) // a 更旧 -1 / 序相等 0 / a 更新 1; 任一非法 -> (0, false)
 ```
 
 - 从外部收进来的版本号, **当路径片段 / 拼进脚本之前必须先过 `IsValid`**。
 - 版本号字符集只有 `[0-9a-zA-Z.-]`, 但拼 URL / 拼 shell 时仍然要照常转义。
+- 排序 / 取较新的 / 判 "不比它旧" 用 `CompareOrder`, **先看 ok 再看 cmp**。
+  "b 不比 a 旧" 要写 `cmp, ok := CompareOrder(b, a); ok && cmp >= 0`, 不要写 `!IsUpgrade(b, a)`: 那样非法版本号也会被当成"不比它旧"放过去。
+- 序相等 (`cmp == 0`) 不等于同一个包, 判同一个包用整串 `==`。
 
 ### 5. 找源码
 
@@ -121,6 +127,43 @@ commitId, ok := hgmBuildVersion.GetCommitId(ver) // 10 位小写 hex; 非法版�
 ```
 
 拿去 `git checkout` / `git archive` 找到这个版本的源代码。**只许拿去找源码**, 不许参与任何判断 (比新旧用 `IsUpgrade`, 判是不是同一个包用整串 `==`)。
+
+### 6. 打包时刻
+
+```go
+tm, ok := hgmBuildVersion.GetBuildTime(ver) // 时区 = GBuildTimeZoneOffsetSecond; 非法版本号 / 时间戳不是真实时刻 -> (time.Time{}, false)
+```
+
+给人看 (例 页面上显示构建时间)、存档用。不要另外再注入一个构建时间变量 (两个来源迟早对不上)。
+
+- 时区不写进版本号: **调它的进程里 `GBuildTimeZoneOffsetSecond` 必须和打包时一样** (常常是运行期的二进制在调, 不是打包程序), 否则差几个小时。最省事是全程用默认值不改。
+- 被 `AddTimeSecond` 挪过的版本号, 读出来的是挪过之后的时刻, 和真实打包时刻差几秒。
+- 比新旧用 `IsUpgrade` / `CompareOrder`, 不要比这个时间。
+
+### 7. 升级测试里拉开序: `AddTimeSecond`
+
+升级的自动测试会在几秒内连着打好几个包, 常常落在同一秒: 序相等, 不算升级。这时把本次打出来的版本号挪一挪:
+
+```go
+next, err := hgmBuildVersion.NewBuildVersion("versionPrefix.txt")
+if !hgmBuildVersion.IsUpgrade(base, next) {
+	next, err = hgmBuildVersion.AddTimeSecond(next, 1) // next 在 base 之后打, 时间戳不会比 base 小, 加 1 秒就够
+}
+```
+
+- 用在: 同一份代码的升级测试 (base -> next)、从 git 打旧版本再升到新版本的测试、拒绝降级的测试 (往前挪, 造一个严格更旧的包)。具体见 [doc/usage.md](doc/usage.md) 第四节。
+- **正式打包不用它**: 正常打包间隔远大于 1 秒, 靠当前时间就够。
+- 按真实时间进位: `…153059` 加 1 秒是 `…153100`, 不是 `…153060`。秒数可正可负。
+- 前缀 / commitId / 脏否原样不动。**挪本次打出来的版本号, 不要挪别的包的**: 挪别的包的会让新包顶着别人的 commitId, 拿着它找到的是别的代码。
+- 结果超出 2000..2099 年 / 原时间戳不是真实时刻 / 版本号非法 时返回 error。
+
+### 8. 前端 (TypeScript)
+
+`ts/hgmBuildVersion.ts`: `IsValid` / `IsUpgrade` / `CompareOrder`, 规则和 Go 版一样, 不依赖任何包, 直接复制进前端工程用。
+
+- `testdata/cases.json` 是 Go 和 TS 共用的用例; `go test` 会顺带用 node 跑 `ts/hgmBuildVersion_test.ts` (本机没有能直接跑 .ts 的 node 时跳过)。
+- 改规则 = 改 `cases.json` + 两边实现, 不许只改一边。
+- 复制进前端的那份不要手改。下游最好在自己的代码生成步骤里从本 module 的目录 (`go list -m -f '{{.Dir}}' github.com/hgmGoLib/hgmBuildVersion`) 复制过去, 不要提交一份手抄的。
 
 实战用法 (自更新怎么写 / 版本号显示在哪 / 升级的真机自动测试 / GitHub 发布) 见 [doc/usage.md](doc/usage.md)。
 设计取舍见 [doc/design.md](doc/design.md) 和 [doc/binaryAndLibVersion.md](doc/binaryAndLibVersion.md)。

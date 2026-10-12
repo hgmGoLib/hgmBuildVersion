@@ -1,7 +1,7 @@
 // Package hgmBuildVersion generates, validates and compares build version strings
 // like "v0.1.260909155041-a1b2c3d4e5-r" (prefix + build timestamp + git commit + clean/dirty flag).
 //
-// 二进制版本号: 生成 (NewBuildVersion) / 校验 (IsValid) / 比大小 (IsUpgrade)。
+// 二进制版本号: 生成 (NewBuildVersion) / 校验 (IsValid) / 比大小 (IsUpgrade / CompareOrder)。
 // 把版本号烤进二进制、运行期读出来见子包 hgmBuildVersionCurrent。
 package hgmBuildVersion
 
@@ -17,14 +17,16 @@ package hgmBuildVersion
 //	r / d           打包时工作区干净(r=release)还是有未提交的修改(d=dirty)
 //
 // ★版本号对调用方是【不透明字符串】: 只能原样传递、判等 ==、交给本包的函数。
-// 本包不提供拆段 / 取脏否 / 取时间戳的函数: 那几段只给人眼看。
-// 唯一的例外是 GetCommitId: "拿着版本号找到源代码"是本库的用途之一, 自动化地找源码 (例 重编旧版本) 需要它;
-// 它取出来的 commitId 只许拿去找源码, 不许参与任何判断。
+// 调用方不许自己拆段 / 比子串 / 改数字: 要什么由本包的函数给。本包不提供取脏否 / 取前缀的函数。
+// 能从里面取的只有两样:
+//   - GetCommitId: 拿着版本号找到源代码 (例 重编旧版本)。只许拿去找源码, 不许参与任何判断。
+//   - GetBuildTime: 打包时刻, 给人看 / 存档 (见 timestamp.go)。
+// 能改的只有时间戳 (AddTimeSecond, 见 timestamp.go)。
 //
 // ★【序】只由前三段决定, 后面两段不参与比大小。
 // commitId 和脏否是【身份/溯源】信息, 不是【序】信息: 谁在前谁在后由打包时间决定, 和哪个 commit 无关。
 // ★"序相等" ≠ "身份相同": 同一秒打的两个不同 commit 的包, 序相同而整串不同。
-// 升级判定 (IsUpgrade) 看【序】; "跑着的是不是这次编译的产物" 看【整串判等】。
+// 升级判定 (IsUpgrade) / 排序 (CompareOrder) 看【序】; "跑着的是不是这次编译的产物" 看【整串判等】。
 //
 // ★字符集刻意只用 [0-9a-zA-Z.-] (全是 RFC 3986 的 unreserved character):
 // 版本号会进 URL、进 shell 脚本、进文件名、进目录名。
@@ -91,20 +93,35 @@ func IsValid(version string) bool {
 // ★后两段 (commitId / 脏否) 不参与: 同一秒打的两个不同 commit 的包互相【不算升级】。
 // 这是想要的 —— 它们谁也不比谁新。
 func IsUpgrade(cur string, target string) bool {
-	curPart, ok := orderParts(cur)
+	cmp, ok := CompareOrder(target, cur)
+	return ok && cmp > 0 // 序全相等 = 同版本, 不升
+}
+
+// CompareOrder 三向比较 a 和 b 的【序】: a 更旧 -1, 序相等 0, a 更新 1。
+// 任一边格式非法 (含空串) -> (0, false)。
+//
+// ★必须先看 ok 再看 cmp: 非法时 cmp 是 0, 不看 ok 就会把"看不懂"当成"一样新"。
+// "b 不比 a 旧" 要写成 `cmp, ok := CompareOrder(b, a); ok && cmp >= 0`, 不要写 !IsUpgrade(b, a) —— 那样非法版本号也会被放过去。
+//
+// ★序相等 (cmp==0) 不等于同一个包: 判是不是同一个包用整串 ==。
+func CompareOrder(a string, b string) (int, bool) {
+	aPart, ok := orderParts(a)
 	if !ok {
-		return false
+		return 0, false
 	}
-	targetPart, ok := orderParts(target)
+	bPart, ok := orderParts(b)
 	if !ok {
-		return false
+		return 0, false
 	}
-	for i := range targetPart {
-		if targetPart[i] != curPart[i] {
-			return targetPart[i] > curPart[i]
+	for i := range aPart {
+		if aPart[i] < bPart[i] {
+			return -1, true
+		}
+		if aPart[i] > bPart[i] {
+			return 1, true
 		}
 	}
-	return false // 序全相等 = 同版本, 不升
+	return 0, true
 }
 
 // GetCommitId 取版本号里打包时 git HEAD 的 commitId (10 位小写 hex), 用来找到这个版本的源代码 (git checkout / git archive)。

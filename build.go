@@ -2,7 +2,7 @@ package hgmBuildVersion
 
 // build.go — 打包侧: 生成本次打包的版本号。
 //
-// ★这里是【唯一】允许生成版本号的地方。同一次打包出来的所有二进制必须共用同一个版本号:
+// ★这里是【唯一】从零生成版本号的地方 (AddTimeSecond 只挪已有版本号的时间戳)。同一次打包出来的所有二进制必须共用同一个版本号:
 // 调用方只调一次 NewBuildVersion, 然后把结果传给每个 target 的 go build。
 // 怎么注入进二进制 / 运行期怎么读, 本包不管 (现成的做法见子包 hgmBuildVersionCurrent)。
 
@@ -37,25 +37,8 @@ var GBuildTimeZoneOffsetSecond = 8 * 3600
 // 在这里拦一刀等于没法测试。"-d" 只给人事后溯源看 —— 它不参与比大小, 也拦不住任何事。
 // 脏否用 git status --porcelain 判: 没被 .gitignore 掉的未跟踪文件也算脏。
 //
-// 正式发布 (要发给别人 / 上线) 用 NewReleaseVersion。
+// 升级测试里同一秒连打几个包要拉开序: 拿结果去 AddTimeSecond (见 timestamp.go)。
 func NewBuildVersion(versionPrefixPath string) (string, error) {
-	return newVersion(versionPrefixPath, false)
-}
-
-// NewReleaseVersion 同 NewBuildVersion, 但多两道闸, 任一不满足就返回 error 不出版本号:
-//
-//  1. 工作区必须干净 (结果一定是 -r): -d 的包有未提交的修改, 拿着版本号找不回准确的源码。
-//  2. HEAD 必须已经推送 (至少被一个远端跟踪分支包含, 即 git branch -r --contains HEAD 非空):
-//     没推送的 commit 只在打包机上, 别人拿着版本号里的 commitId 找不到代码。
-//     ★看的是本地记录的远端跟踪分支 (git push / git fetch 时更新), 不联网去问远端。
-//
-// 发布脚本用它代替自己再跑一遍 git status。开发测试打包用 NewBuildVersion (脏工作区照样打)。
-func NewReleaseVersion(versionPrefixPath string) (string, error) {
-	return newVersion(versionPrefixPath, true)
-}
-
-// newVersion NewBuildVersion / NewReleaseVersion 的共同实现。release=true 时多查 干净 + 已推送。
-func newVersion(versionPrefixPath string, release bool) (string, error) {
 	data, err := ioutil.ReadFile(versionPrefixPath)
 	if err != nil {
 		return "", fmt.Errorf("读版本号前缀 %s 失败: %w", versionPrefixPath, err)
@@ -82,18 +65,6 @@ func newVersion(versionPrefixPath string, release bool) (string, error) {
 		return "", fmt.Errorf("取 git status 失败: %w", err)
 	}
 	dirty := strings.TrimSpace(st) != ""
-	if release {
-		if dirty {
-			return "", fmt.Errorf("正式发布要求工作区干净, 但 %s 所在仓库有未提交的修改 (git status --porcelain):\n%s", gitDir, st)
-		}
-		br, err := runGit(gitDir, "branch", "-r", "--contains", commitId)
-		if err != nil {
-			return "", fmt.Errorf("查 HEAD 有没有推送失败: %w", err)
-		}
-		if strings.TrimSpace(br) == "" {
-			return "", fmt.Errorf("正式发布要求 HEAD (%s) 已推送到远端, 但没有任何远端跟踪分支包含它: 先 git push", commitId)
-		}
-	}
 	stamp := time.Now().In(time.FixedZone("", GBuildTimeZoneOffsetSecond)).Format("060102150405")
 	version := makeVersion(prefix, stamp, commitId, dirty)
 	// 拼完立刻校一遍: 前缀写错 (段数不对/带字母) 在这里就炸, 而不是等到部署后升不了级。

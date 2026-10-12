@@ -1,8 +1,13 @@
 package hgmBuildVersion
 
-// version_test.go — 格式 (makeVersion / IsValid)、比序 (IsUpgrade)。
+// version_test.go — 格式 (makeVersion / IsValid)、比序 (IsUpgrade / CompareOrder)。
 
 import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -29,77 +34,65 @@ const (
 	verADup = "v0.1.260901140715-ffffffffff-d" // 与 verA 【序相同身份不同】
 )
 
-// 【序】= 前三段 uint64 从前往后比: 前面的段不同就以它定胜负, 相等才看下一段; 序全等 = 同版本, 不升。
-func TestIsUpgradeComparesOrderOnly(t *testing.T) {
-	// 第三段 (打包时间戳) 递增 —— 日常唯一会变的那一段。
-	testEqual(t, IsUpgrade(verA, verANew), true)
-	testEqual(t, IsUpgrade(verANew, verA), false) // 降级不升
-	testEqual(t, IsUpgrade(verA, verA), false)    // 同版本不升
-
-	// 前两段 (versionPrefix.txt) 优先级更高: 段1 更大就算更新, 哪怕时间戳更早。
-	testEqual(t, IsUpgrade("v0.9.269999999999-aaaaaaaaaa-r", "v1.0.260101000000-bbbbbbbbbb-r"), true)
-	testEqual(t, IsUpgrade("v1.0.260101000000-bbbbbbbbbb-r", "v0.9.269999999999-aaaaaaaaaa-r"), false)
-	// 段1 相等则看段2。
-	testEqual(t, IsUpgrade(verA, "v0.2.260101000000-aaaaaaaaaa-r"), true)
-	testEqual(t, IsUpgrade("v0.2.260101000000-aaaaaaaaaa-r", "v0.1.269999999999-aaaaaaaaaa-r"), false)
-
-	// 不是按字符串比: "10" > "9" 在数字上成立, 在字典序上不成立。
-	testEqual(t, IsUpgrade("v0.9.260901140715-aaaaaaaaaa-r", "v0.10.260901140715-aaaaaaaaaa-r"), true)
-}
-
-// ★后两段 (commitId / 脏否) 【不参与比大小】—— 这正是把它们放在序后面的意义。
-// 同一秒打的两个不同 commit 的包互相都不算升级; 脏包也顶不掉同一秒的干净包 (那件事得在打包口拦)。
-func TestIsUpgradeIgnoresIdentitySuffix(t *testing.T) {
-	testOk(t, verA != verADup, "这两个串本来就该不相等 (身份不同), 否则下面的断言没有意义")
-	testEqual(t, IsUpgrade(verA, verADup), false)
-	testEqual(t, IsUpgrade(verADup, verA), false)
-	// 但只要序更新, 后缀怎么变都算升级。
-	testEqual(t, IsUpgrade(verADup, verANew), true)
-}
-
-// 任何一边格式不合法 -> 不升 (看不懂的时候不动比乱动安全), 且取序取不出东西。
-//
-// ★这张表同时是【路径穿越】那条防线的钉子: 版本号可能从外部收进来当目录名,
-// 格式整串锁死之后 ".." 和 "/" 在语法上就进不来 (见 version.go 的 validVersionSuffix)。
-func TestIsUpgradeRefusesMalformed(t *testing.T) {
-	for _, bad := range []string{
-		"", "dev", "260901140715", // 根本不是版本号
-		"v0.1", "v0.1.2.3", // 序的段数不对
-		"v0.1.260901140715", "v0.10.269999999999", // 缺身份后缀
-		"v0.1.", "v.1.2", // 空段
-		"v0.1.26090114071a", "v0.1. 260901140715", "v0.1.+260901140715", // 序里有非数字
-		"v0.1.26090114071", "v0.1.2609011407150", // 时间戳不是 12 位
-		"v0.01.260901140715-a1b2c3d4e5-r", // 段2 前导零 (同一版本会有两种写法)
-		"v0.99999999999999999999999.260901140715-a1b2c3d4e5-r", // 段2 溢出 uint64
-		"0.1.260901140715-a1b2c3d4e5-r",                        // 少了 v
-
-		// ── 身份后缀那半: 恰好 <10位小写hex>-<r|d>, 差一点都不行 ──
-		"v0.1.260901140715-",               // 后缀为空
-		"v0.1.260901140715-a1b2c3d4e5",     // 少了脏否那段
-		"v0.1.260901140715-a1b2c3d4e5-",    // 脏否为空
-		"v0.1.260901140715-a1b2c3d4e5-x",   // 脏否不是 r/d
-		"v0.1.260901140715-a1b2c3d4e5-rd",  // 脏否多一个字符
-		"v0.1.260901140715-a1b2c3d4e-r",    // commitId 只有 9 位
-		"v0.1.260901140715-a1b2c3d4e5d-r",  // commitId 11 位
-		"v0.1.260901140715-A1B2C3D4E5-r",   // commitId 大写 (只认小写 hex, 免得同一个包两种写法)
-		"v0.1.260901140715-a1b2c3d4eg-r",   // commitId 不是 hex
-		"v0.1.260901140715-a1b2c3d4e5-r-d", // 后缀三段
-		"v0.1.260901140715-a1b2c3d4e5.r",   // 旧格式 (commitId 和脏否之间是 '.'): 本库只认当前格式, 见 doc/formatMigration.md
-
-		// ── 拿去当路径片段的危险形态: 必须一个都进不来 ──
-		"../../etc", "v0/1/2", "v0.1.26/../..",
-		"v0.1.260901140715-..",
-		"v0.1.260901140715-a1b2c3d4e5--r",
-		"v0.1.260901140715-a1b2c3d4e5-..",
-		"v0.1.260901140715-../etc/pw-r",
-		"v0.1.260901140715-a1b2c3d4e5-r/x",
-		"v0.1.260901140715-a1b2c3d4e5-r\x00", // 尾部有 NUL
-	} {
-		testOk(t, !IsValid(bad), "应判非法: "+bad)
-		testOk(t, !IsUpgrade(verA, bad), "非法目标版本不许升: "+bad)
-		testOk(t, !IsUpgrade(bad, verA), "当前版本非法时不许升: "+bad)
+// testCases_t testdata/cases.json: Go 和 TS (ts/hgmBuildVersion_test.ts) 共用的用例。
+type testCases_t struct {
+	IsValid []struct {
+		Version string
+		Want    bool
+		Note    string
 	}
-	testOk(t, IsValid(verA), "正常版本号应判合法")
+	CompareOrder []struct {
+		A    string
+		B    string
+		Cmp  int
+		Ok   bool
+		Note string
+	}
+}
+
+// 共用用例: 格式校验 + 比序。
+//
+// ★IsValid 那张表同时是【路径穿越】那条防线的钉子: 版本号可能从外部收进来当目录名,
+// 格式整串锁死之后 ".." 和 "/" 在语法上就进不来 (见 version.go 的 validVersionSuffix)。
+// ★后两段 (commitId / 脏否) 【不参与比大小】: 同一秒打的两个不同 commit 的包序相等, 互相都不算升级。
+func TestSharedCases(t *testing.T) {
+	data, err := ioutil.ReadFile(filepath.Join("testdata", "cases.json"))
+	testOk(t, err == nil, "读 testdata/cases.json 失败")
+	var cases testCases_t
+	testOk(t, json.Unmarshal(data, &cases) == nil, "解析 testdata/cases.json 失败")
+	testOk(t, len(cases.IsValid) > 0 && len(cases.CompareOrder) > 0, "用例为空")
+	for _, c := range cases.IsValid {
+		testOk(t, IsValid(c.Version) == c.Want, fmt.Sprintf("IsValid(%q) 应为 %v: %s", c.Version, c.Want, c.Note))
+		if c.Want {
+			continue
+		}
+		// 任何一边格式不合法 -> 比不出来, 也不升 (看不懂的时候不动比乱动安全)。
+		_, ok := CompareOrder(verA, c.Version)
+		testOk(t, !ok, "非法版本号不应比得出序: "+c.Note)
+		_, ok = CompareOrder(c.Version, verA)
+		testOk(t, !ok, "非法版本号不应比得出序: "+c.Note)
+		testOk(t, !IsUpgrade(verA, c.Version), "非法目标版本不许升: "+c.Note)
+		testOk(t, !IsUpgrade(c.Version, verA), "当前版本非法时不许升: "+c.Note)
+	}
+	for _, c := range cases.CompareOrder {
+		cmp, ok := CompareOrder(c.A, c.B)
+		testOk(t, cmp == c.Cmp && ok == c.Ok, fmt.Sprintf("CompareOrder(%q, %q) = (%d, %v), 应为 (%d, %v): %s", c.A, c.B, cmp, ok, c.Cmp, c.Ok, c.Note))
+		testOk(t, IsUpgrade(c.A, c.B) == (c.Ok && c.Cmp < 0), fmt.Sprintf("IsUpgrade(%q, %q) 和 CompareOrder 对不上: %s", c.A, c.B, c.Note))
+	}
+}
+
+// TS 实现跑同一份用例。本机没有 node (或 node 太老, 不能直接跑 .ts) 时跳过。
+func TestTsImpl(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("本机没有 node, 跳过 TS 实现的测试")
+	}
+	out, err := exec.Command(nodePath, "-e", "process.exit(typeof process.features.typescript === 'string' ? 0 : 1)").CombinedOutput()
+	if err != nil {
+		t.Skip("node 不能直接跑 .ts (要 node 22.18 / 23.6 以上), 跳过 TS 实现的测试: " + string(out))
+	}
+	out, err = exec.Command(nodePath, filepath.Join("ts", "hgmBuildVersion_test.ts")).CombinedOutput()
+	testOk(t, err == nil, "TS 实现的测试失败:\n"+string(out))
 }
 
 // GetCommitId 取出的就是版本号里那 10 位; 非法版本号取不出。
