@@ -7,12 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 )
 
-// testGitRepo_t 系统临时目录里的一个真 git 仓库: 已提交一份 versionPrefix.txt (内容 v0.1)。
+// testGitRepo_t 系统临时目录里的一个真 git 仓库: 已提交一份 versionPrefix.txt (内容 v0.0.1)。
 type testGitRepo_t struct {
 	t          *testing.T
 	Dir        string
@@ -27,7 +28,7 @@ func newTestGitRepo(t *testing.T) *testGitRepo_t {
 	}
 	r := &testGitRepo_t{t: t, Dir: dir, PrefixPath: filepath.Join(dir, "versionPrefix.txt")}
 	r.Git("init", "-q")
-	testOk(t, ioutil.WriteFile(r.PrefixPath, []byte("v0.1\n"), 0644) == nil, "write versionPrefix.txt")
+	testOk(t, ioutil.WriteFile(r.PrefixPath, []byte("v0.0.1\n"), 0644) == nil, "write versionPrefix.txt")
 	r.Git("add", "versionPrefix.txt")
 	r.Git("commit", "-q", "-m", "init")
 	r.CommitId = r.Git("rev-parse", "HEAD")[:versionCommitIdLen]
@@ -71,9 +72,11 @@ func TestNewBuildVersion(t *testing.T) {
 		ver, err := NewBuildVersion(r.PrefixPath)
 		testOk(t, err == nil, "NewBuildVersion 失败")
 		testOk(t, IsValid(ver), "生成的版本号应合法: "+ver)
+		testOk(t, testVersionRe.MatchString(ver), "生成的版本号形态不对: "+ver)
+		testOk(t, strings.HasPrefix(ver, "v0.0.1-"), "前缀应原样带上: "+ver)
 		testOk(t, strings.HasSuffix(ver, "-"+r.CommitId+"-r"), "干净工作区应以 -<commitId>-r 结尾: "+ver)
 		// 时间戳按给定偏移解析回来, 应当就是现在。
-		stamp := strings.TrimPrefix(ver[:strings.IndexByte(ver, '-')], "v0.1.")
+		stamp := ver[len("v0.0.1-") : len("v0.0.1-")+12]
 		tm, err := time.ParseInLocation("060102150405", stamp, time.FixedZone("", offset))
 		testOk(t, err == nil, "时间戳解析失败: "+stamp)
 		diff := time.Since(tm)
@@ -87,9 +90,37 @@ func TestNewBuildVersion(t *testing.T) {
 	testOk(t, strings.HasSuffix(ver, "-"+r.CommitId+"-d"), "有未跟踪文件应以 -d 结尾: "+ver)
 
 	// 前缀写错 -> 打包口当场报错。
-	testOk(t, ioutil.WriteFile(r.PrefixPath, []byte("v0.1.2"), 0644) == nil, "write bad prefix")
-	_, err = NewBuildVersion(r.PrefixPath)
-	testOk(t, err != nil, "前缀三段应返回 error")
+	for _, bad := range []string{"v1", "v0.1.2.3", "v0.01.0", "v0.0.01", "vx", "0.0.1", "v0.0.1-rc", "v0.0.1+b", "\n"} {
+		testOk(t, ioutil.WriteFile(r.PrefixPath, []byte(bad), 0644) == nil, "write bad prefix")
+		_, err = NewBuildVersion(r.PrefixPath)
+		testOk(t, err != nil, "前缀写错应返回 error: "+bad)
+	}
+}
+
+// 生成的版本号形态: v<a>.<b>.<c>-<12位时间戳>-<10位小写hex>-<r|d>。
+var testVersionRe = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9]{12}-[0-9a-f]{10}-[rd]$`)
+
+// 两段前缀 (v0.0.6 及以前的格式) 直接报错, 不自动补 .0: v0.19 -> v0.19.0-... 在 semver 里比旧格式 v0.19.<时间戳>-... 的包旧。
+// ★报错信息要能照着改: 建议值 = 第二段 +1 再补 .0 (比所有旧格式的包都新), 并提到清理掉旧包后可以从 v0.0.1 开始。
+func TestNewBuildVersionTwoPartPrefix(t *testing.T) {
+	r := newTestGitRepo(t)
+	defer os.RemoveAll(r.Dir)
+	for _, c := range []struct {
+		Prefix  string
+		Suggest string
+	}{
+		{"v0.19", "v0.20.0"},
+		{"v0.1\n", "v0.2.0"},
+		{"v1.9", "v1.10.0"},
+		{"v0.99", "v0.100.0"},
+		{"v2.18446744073709551615", "v2.18446744073709551616.0"},
+	} {
+		testOk(t, ioutil.WriteFile(r.PrefixPath, []byte(c.Prefix), 0644) == nil, "write prefix")
+		_, err := NewBuildVersion(r.PrefixPath)
+		testOk(t, err != nil, "两段前缀应返回 error: "+c.Prefix)
+		testOk(t, strings.Contains(err.Error(), c.Suggest), "报错信息应建议改成 "+c.Suggest+": "+err.Error())
+		testOk(t, strings.Contains(err.Error(), "v0.0.1"), "报错信息应提到可以从 v0.0.1 重新开始: "+err.Error())
+	}
 }
 
 // 前缀文件没被 git 跟踪 (被 ignore / 在外层仓库里被 ignore 的子目录) -> error, 而不是照样出 -r。
@@ -99,23 +130,23 @@ func TestNewBuildVersionUntrackedPrefix(t *testing.T) {
 	testOk(t, ioutil.WriteFile(filepath.Join(r.Dir, ".git", "info", "exclude"), []byte("/ignored.txt\n/sub/\n"), 0644) == nil, "write exclude")
 
 	ignoredPath := filepath.Join(r.Dir, "ignored.txt")
-	testOk(t, ioutil.WriteFile(ignoredPath, []byte("v0.1\n"), 0644) == nil, "write ignored.txt")
+	testOk(t, ioutil.WriteFile(ignoredPath, []byte("v0.0.1\n"), 0644) == nil, "write ignored.txt")
 	_, err := NewBuildVersion(ignoredPath)
 	testOk(t, err != nil, "被 ignore 的前缀文件应返回 error")
 
 	// 没有 .git 的被 ignore 子目录: git 往上找到外层仓库, 工作区干净, 不拦的话会出外层 commitId 的 -r。
 	testOk(t, os.Mkdir(filepath.Join(r.Dir, "sub"), 0755) == nil, "mkdir sub")
 	subPath := filepath.Join(r.Dir, "sub", "versionPrefix.txt")
-	testOk(t, ioutil.WriteFile(subPath, []byte("v0.1\n"), 0644) == nil, "write sub/versionPrefix.txt")
+	testOk(t, ioutil.WriteFile(subPath, []byte("v0.0.1\n"), 0644) == nil, "write sub/versionPrefix.txt")
 	_, err = NewBuildVersion(subPath)
 	testOk(t, err != nil, "被 ignore 子目录里的前缀文件应返回 error")
 
 	// 文件名带通配字符: 按字面匹配, 不能因为 "v[ab].txt" 能匹配到已跟踪的 va.txt 就放过。
-	testOk(t, ioutil.WriteFile(filepath.Join(r.Dir, "va.txt"), []byte("v0.1\n"), 0644) == nil, "write va.txt")
+	testOk(t, ioutil.WriteFile(filepath.Join(r.Dir, "va.txt"), []byte("v0.0.1\n"), 0644) == nil, "write va.txt")
 	r.Git("add", "va.txt")
 	r.Git("commit", "-q", "-m", "va")
 	globPath := filepath.Join(r.Dir, "v[ab].txt")
-	testOk(t, ioutil.WriteFile(globPath, []byte("v0.1\n"), 0644) == nil, "write v[ab].txt")
+	testOk(t, ioutil.WriteFile(globPath, []byte("v0.0.1\n"), 0644) == nil, "write v[ab].txt")
 	_, err = NewBuildVersion(globPath)
 	testOk(t, err != nil, "文件名带通配字符且没被跟踪的前缀文件应返回 error")
 	testOk(t, os.Remove(globPath) == nil, "remove v[ab].txt") // 下面要求工作区干净
@@ -134,7 +165,7 @@ func TestNewBuildVersionGitStderr(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 	prefixPath := filepath.Join(dir, "versionPrefix.txt")
-	testOk(t, ioutil.WriteFile(prefixPath, []byte("v0.1\n"), 0644) == nil, "write versionPrefix.txt")
+	testOk(t, ioutil.WriteFile(prefixPath, []byte("v0.0.1\n"), 0644) == nil, "write versionPrefix.txt")
 	defer testSetenv("LC_ALL", "C")() // 钉住 git 的输出语言
 	// 临时目录可能在某个 git 仓库下面 (TMPDIR 设在项目里 / $HOME 整个用 git 管): 不许 git 往上找。
 	defer testSetenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))()

@@ -1,17 +1,18 @@
 package hgmBuildVersion
 
-// timestamp.go — 第三段 (打包时间戳 YYMMDDhhmmss) 的读 (GetBuildTime) 和改 (AddTimeSecond)。
+// timestamp.go — 打包时间戳 (YYMMDDhhmmss, 前缀后面第一个 '-' 之后那 12 位) 的读 (GetBuildTime) 和改 (AddTimeSecond)。
 //
 // ★两位年份一律当 20YY (2000..2099)。不用 time.Parse 的 "06": 它把 69..99 解析成 19xx,
 // 2068 年加 1 秒格式化出 "69", 再解析回来就成了 1969 年。
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
 // GetBuildTime 取版本号里的打包时刻。时间戳按 GBuildTimeZoneOffsetSecond 解释, 返回值的时区就是这个固定偏移。
-// 版本号非法 (含空串) / 时间戳不是真实存在的时刻 (例 13 月) -> (time.Time{}, false)。
+// 不是本库格式 (含空串、合法的外来 semver) / 时间戳不是真实存在的时刻 (例 13 月) -> (time.Time{}, false)。
 //
 // ★时区不写进版本号: 调它的进程 (常常是运行期的二进制, 不是打包程序) 里 GBuildTimeZoneOffsetSecond 必须和打包时一样,
 // 否则读出来的时刻差几个小时。最省事的办法是全程用默认值不改。
@@ -31,7 +32,7 @@ func GetBuildTime(version string) (time.Time, bool) {
 // 前缀 / commitId / 脏否原样不动。结果和时区无关 (固定偏移下加减秒数不受偏移影响)。
 //
 // 返回 error:
-//   - version 非法 (含空串);
+//   - version 不是本库格式 (含空串、合法的外来 semver);
 //   - 时间戳不是真实存在的时刻 (例 13 月);
 //   - 结果超出两位年份能表示的范围 (2000..2099)。
 //
@@ -52,36 +53,33 @@ func GetBuildTime(version string) (time.Time, bool) {
 func AddTimeSecond(version string, second int64) (string, error) {
 	stamp, ok := getVersionStamp(version)
 	if !ok {
-		return "", fmt.Errorf("AddTimeSecond: 版本号不合法: %q", version)
+		return "", fmt.Errorf("AddTimeSecond: invalid version: %q", version)
 	}
 	t, ok := parseStamp(stamp, time.UTC)
 	if !ok {
-		return "", fmt.Errorf("AddTimeSecond: 版本号 %q 的时间戳不是真实存在的时刻", version)
+		return "", fmt.Errorf("AddTimeSecond: the timestamp of version %q is not a real point in time", version)
 	}
 	// 2000..2099 一共约 3.2e9 秒: 先挡掉离谱的 second, 免得 Unix() + second 溢出 int64。
 	const maxSecond = 200 * 366 * 24 * 3600
 	if second > maxSecond || second < -maxSecond {
-		return "", fmt.Errorf("AddTimeSecond: %q 加 %d 秒超出 2000..2099 年", version, second)
+		return "", fmt.Errorf("AddTimeSecond: %q plus %d seconds is outside the years 2000..2099", version, second)
 	}
 	newT := time.Unix(t.Unix()+second, 0).UTC()
 	if newT.Year() < 2000 || newT.Year() > 2099 {
-		return "", fmt.Errorf("AddTimeSecond: %q 加 %d 秒超出 2000..2099 年 (时间戳只有两位年份)", version, second)
+		return "", fmt.Errorf("AddTimeSecond: %q plus %d seconds is outside the years 2000..2099 (the timestamp has a two-digit year)", version, second)
 	}
-	end := len(version) - versionSuffixLen // 时间戳之后就是 -<commitId>-<r|d>
-	return version[:end-versionStampLen] + formatStamp(newT) + version[end:], nil
+	start := strings.IndexByte(version, '-') + 1
+	return version[:start] + formatStamp(newT) + version[start+versionStampLen:], nil
 }
 
-// versionSuffixLen 身份后缀 "-<10位commitId>-<r|d>" 的固定长度。
-const versionSuffixLen = 1 + versionCommitIdLen + 2
-
-// getVersionStamp 取合法版本号里的 12 位时间戳; 非法 -> ok=false。
+// getVersionStamp 取本库格式版本号里的 12 位时间戳; 不是本库格式 -> ok=false。
 func getVersionStamp(version string) (string, bool) {
 	if !IsValid(version) {
 		return "", false
 	}
-	// 合法版本号的结尾定长: <12位时间戳>-<10位commitId>-<r|d>。
-	end := len(version) - versionSuffixLen
-	return version[end-versionStampLen : end], true
+	// 本库格式的前缀里没有 '-', 第一个 '-' 之后就是 <12位时间戳>-<10位commitId>-<r|d>。
+	start := strings.IndexByte(version, '-') + 1
+	return version[start : start+versionStampLen], true
 }
 
 // parseStamp 把 12 位数字的时间戳按 20YY 解析成 loc 时区里的时刻。

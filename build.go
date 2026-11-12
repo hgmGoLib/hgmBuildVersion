@@ -34,23 +34,28 @@ var GBuildTimeZoneOffsetSecond = 8 * 3600
 // ★需要本机有 git 命令且该文件已被 git 跟踪: 没有 git (例如从源码压缩包构建) / 文件没 git add / 被 .gitignore 掉 直接返回 error, 不猜。
 //
 // ★工作区脏的时候【照样打】, 只是版本号末尾变成 -d: 开发期工作区基本总是脏的,
-// 在这里拦一刀等于没法测试。"-d" 只给人事后溯源看 —— 它不参与比大小, 也拦不住任何事。
+// 在这里拦一刀等于没法测试。"-d" 只给人事后溯源看 —— 只在同一秒同一 commit 时影响先后 (semver 按 ASCII 比, d < r), 拦不住任何事。
 // 脏否用 git status --porcelain 判: 没被 .gitignore 掉的未跟踪文件也算脏。
 //
 // 升级测试里同一秒连打几个包要拉开序: 拿结果去 AddTimeSecond (见 timestamp.go)。
 func NewBuildVersion(versionPrefixPath string) (string, error) {
 	data, err := ioutil.ReadFile(versionPrefixPath)
 	if err != nil {
-		return "", fmt.Errorf("读版本号前缀 %s 失败: %w", versionPrefixPath, err)
+		return "", fmt.Errorf("read version prefix %s failed: %w", versionPrefixPath, err)
 	}
 	prefix := strings.TrimSpace(string(data))
 	if prefix == "" {
-		return "", fmt.Errorf("%s 是空的, 里面应该是版本号前缀, 例 v0.1", versionPrefixPath)
+		return "", fmt.Errorf("%s is empty, it should contain the version prefix, e.g. v0.0.1", versionPrefixPath)
+	}
+	// 前缀先校验再跑 git: 写错了不用等 git, 报错信息也更准。
+	err = checkVersionPrefix(prefix)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", versionPrefixPath, err)
 	}
 	gitDir := filepath.Dir(versionPrefixPath)
 	out, err := runGit(gitDir, "rev-parse", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("取 git commitId 失败: %w", err)
+		return "", fmt.Errorf("get git commitId failed: %w", err)
 	}
 	commitId := strings.TrimSpace(out)
 	// ★前缀文件本身必须被 git 跟踪: git status 不报被 ignore 的文件, 被 ignore 时照样会出 -r;
@@ -58,21 +63,72 @@ func NewBuildVersion(versionPrefixPath string) (string, error) {
 	// --literal-pathspecs: 文件名按字面匹配, 否则 "v[ab].txt" 会被当通配模式, 匹配到别的已跟踪文件就误放过。
 	_, err = runGit(gitDir, "--literal-pathspecs", "ls-files", "--error-unmatch", "--", filepath.Base(versionPrefixPath))
 	if err != nil {
-		return "", fmt.Errorf("%s 没被 git 跟踪 (没 git add, 或被 .gitignore 掉了), 版本号前缀必须提交进 git: %w", versionPrefixPath, err)
+		return "", fmt.Errorf("%s is not tracked by git (not git added, or ignored by .gitignore); the version prefix must be committed to git: %w", versionPrefixPath, err)
 	}
 	st, err := runGit(gitDir, "status", "--porcelain")
 	if err != nil {
-		return "", fmt.Errorf("取 git status 失败: %w", err)
+		return "", fmt.Errorf("get git status failed: %w", err)
 	}
 	dirty := strings.TrimSpace(st) != ""
 	stamp := time.Now().In(time.FixedZone("", GBuildTimeZoneOffsetSecond)).Format("060102150405")
 	version := makeVersion(prefix, stamp, commitId, dirty)
 	// 拼完立刻校一遍: 前缀写错 (段数不对/带字母) 在这里就炸, 而不是等到部署后升不了级。
 	if !IsValid(version) {
-		return "", fmt.Errorf("拼出来的版本号 %q 不合法: 检查 %s 的内容, 应形如 v0.1 (两段纯数字, 不许前导零)",
+		return "", fmt.Errorf("assembled version %q is invalid: check the content of %s, it should look like v0.0.1 (three decimal parts, no leading zeros)",
 			version, versionPrefixPath)
 	}
 	return version, nil
+}
+
+// checkVersionPrefix 前缀必须是 v<a>.<b>.<c> (三段十进制, 不许前导零)。
+//
+// ★两段 (v0.0.6 及以前的格式, 例 v0.19) 直接报错, 不自动补成 v0.19.0:
+// 旧格式的包是 v0.19.<时间戳>-..., 在 semver 里比 v0.19.0-... 大, 自动补 .0 之后新包反而比所有旧包 "旧" ——
+// 新的服务端判 "不算升级", 部署被静默挡住; 新二进制看到旧包还会当成升级降回去。
+// 报错信息直接给出能用的值: 第二段 +1 再补 .0 (v0.19 -> v0.20.0, 比所有旧格式的包都新);
+// 旧格式的包都清理干净了的话也可以从 v0.0.1 重新开始。
+func checkVersionPrefix(prefix string) error {
+	p, ok := parseSemver(prefix)
+	if ok && p.pre == "" && !p.hasBuild {
+		return nil
+	}
+	if a, b, ok := splitTwoPartPrefix(prefix); ok {
+		suggest := "v" + a + "." + incDecimal(b) + ".0"
+		return fmt.Errorf("version prefix %q is the old two-part format, the prefix must have three parts now: "+
+			"change it to %s (newer than every package built with the old %s.<timestamp> format), "+
+			"or start again from v0.0.1 if no package of the old format is still in use",
+			prefix, suggest, prefix)
+	}
+	return fmt.Errorf("version prefix %q is invalid, it should look like v0.0.1 (three decimal parts, no leading zeros)", prefix)
+}
+
+// splitTwoPartPrefix "v<a>.<b>" (两段十进制, 不许前导零) -> (a, b, true)。
+func splitTwoPartPrefix(prefix string) (string, string, bool) {
+	if len(prefix) < 2 || prefix[0] != 'v' {
+		return "", "", false
+	}
+	a, i, ok := scanCoreNum(prefix, 1)
+	if !ok || i >= len(prefix) || prefix[i] != '.' {
+		return "", "", false
+	}
+	b, i, ok := scanCoreNum(prefix, i+1)
+	if !ok || i != len(prefix) {
+		return "", "", false
+	}
+	return a, b, true
+}
+
+// incDecimal 十进制数字串 +1 (不限位数): "19" -> "20", "99" -> "100"。
+func incDecimal(s string) string {
+	buf := []byte(s)
+	for i := len(buf) - 1; i >= 0; i-- {
+		if buf[i] < '9' {
+			buf[i]++
+			return string(buf)
+		}
+		buf[i] = '0'
+	}
+	return "1" + string(buf)
 }
 
 // runGit 在 dir 里跑一条 git 命令, 返回 stdout。
@@ -85,7 +141,7 @@ func runGit(dir string, args ...string) (string, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("在 %s 跑 git %s 失败: %w: %s", dir, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("run git %[2]s in %[1]s failed: %[3]w: %[4]s", dir, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }

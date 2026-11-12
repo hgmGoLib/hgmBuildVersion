@@ -1,0 +1,82 @@
+从 hgmBuildVersion v0.0.6 (及以前) 升到 v0.0.7 —— 调用者要处理的事
+======================================================================
+
+这一版是【格式 + 比较语义】的 BC, 没有编译错误 (公开 API 的名字和签名一个没变), 但不处理会出两种事:
+  - 打包直接失败 (versionPrefix.txt 还是两段) —— 这个会报错, 照着报错改就行;
+  - 已部署的旧二进制 / 服务端判 "要不要升级" 判错 —— 这个【不报错, 静默】, 是本文的重点.
+
+
+一、变了什么
+------------------------------------------------------------
+                      v0.0.6 及以前 (旧格式)                    v0.0.7 (新格式)
+  版本号              v0.1.260909155041-a1b2c3d4e5-r             v0.0.1-260909155041-a1b2c3d4e5-r
+  versionPrefix.txt   两段 v0.1                                  三段 v0.0.1 (两段直接报错)
+  CompareOrder /      只认本库格式, 比 "前缀两段 + 时间戳" 三段   semver 2.0.0 优先级, 认任何 semver (v 开头 / 写满三段 / <=256 字节);
+  IsUpgrade           commitId / 脏否不参与比较                  同一秒的两个包也按 commitId / 脏否分先后 (有先后但没有含义)
+  IsValid             只认旧格式                                 只认新格式 (旧格式 -> false)
+  GetCommitId /       只认旧格式                                 只认新格式 (旧格式 -> 失败)
+  GetBuildTime /
+  AddTimeSecond
+  ts/hgmBuildVersion.ts  BigInt                                  不用 BigInt; 规则同 Go 版, 需要重新复制进前端
+
+以后再改后缀格式, 只要前缀 +1 (例 v0.0.1 -> v0.0.2), 不用再走一次本文这种迁移 (见 formatMigration.md 第零节).
+
+
+二、迁移风险: 旧格式的包在新比较器眼里【更新】
+------------------------------------------------------------
+旧格式 v0.19.260909155041-a1b2c3d4e5-r 是合法 semver (major 0, minor 19, patch 260909155041), 新比较器照样能比:
+  v0.19.260909155041-...  >  v0.19.0-...  >  v0.0.1-...
+所以【有已部署实例】的项目, 新前缀必须在 semver 上压过所有旧格式的包: 两段 v0.N 改成 v0.(N+1).0 (第二段 +1, 第三段 0).
+  - 新二进制 (v0.0.7) 看旧格式的包: 比自己旧, 不会降回去. ✔
+  - 旧二进制 (v0.0.6 及以前) 看新格式: IsValid=false -> IsUpgrade=false, 【静默不升】. 要靠服务端降格 (见下面第四节).
+NewBuildVersion 遇到两段前缀会报错并给出这个建议值 (例 v0.19 -> "change it to v0.20.0").
+没有任何旧格式的包还在用 (新项目 / 全部重装过) 时, 可以从 v0.0.1 重新开始.
+
+
+三、逐项目清单 (本机 ~/work 下用到本库的项目, 2026-11-12 调查)
+------------------------------------------------------------
+项目                     现在的前缀   建议的新前缀   要复查的地方
+acnAiChat                v0.1         v0.2.0         make/release 用 AddTimeSecond / GetBuildTime (新格式下照用, 测试数据换新格式)
+acnWebAppOpsProj         v0.1         v0.2.0         见下 "decide.go:30"; eiwhInstaller 的 IsUpgrade; eiwhSite / eiwhRealTest 的 AddTimeSecond / GetBuildTime;
+                                                     eiwhAppUi/server.go:482 的 CompareOrder
+cp_aicoding              v0.1         v0.2.0
+hgmOpsAgentProj          v0.1         v0.2.0         go.mod 钉的是 v0.0.4 (更老, 两段前缀 + 后缀 '.' 分隔的格式), 直接 go get v0.0.7;
+                                                     make/tE2e* 的 IsUpgrade 升级测试
+ascpTestProj2/asc        v0.19        v0.20.0
+ascpTestProj3/asc        v0.16        v0.17.0
+ascpTestProj9/asc        v0.13        v0.14.0
+(不确定有没有已部署实例的, 按 "有" 处理, 用右边的建议值; 它比 v0.0.1 只是数字大一点, 没有别的代价.)
+
+每个项目都要做:
+  1. go get github.com/hgmGoLib/hgmBuildVersion@v0.0.7
+  2. 改 versionPrefix.txt 为上表的新前缀, commit.
+  3. 前端复制过 ts/hgmBuildVersion.ts 的, 重新复制.
+  4. 测试里写死的旧格式版本号 (例 升级测试的 oldVersion 常量 / 断言用的样例串) 换成新格式; GetCommitId 对旧格式会返回失败.
+  5. grep 自己的代码里有没有 "cmp == 0 当成同一个包" / "c != 0 当成版本不同" 的用法, 见下.
+  6. 有自更新的, 按第四节处理已部署的旧二进制.
+
+★decide.go:30 (acnWebAppOpsProj platform/internal/eiwhAppUi/decide.go, Decide 函数):
+    if c, ok := hgmBuildVersion.CompareOrder(pkg.Version, installed.Version); ok && c != 0 { upgrade / downgrade }
+    旧语义: 同一秒不同 commit 的两个包 c == 0 -> 落到下面按 Version+CodeHash 判 installed / reinstall.
+    新语义: 同一秒不同 commit 的两个包 c != 0 (按 commitId 字典序), 会被判成 upgrade 或 downgrade.
+    对本库格式 c == 0 现在等价于 pkg.Version == installed.Version. 要不要保留 "同一秒算 reinstall" 由那个项目自己定;
+    要保留的话, 判 upgrade / downgrade 之前先比 GetBuildTime 是否同一秒.
+    另: 它注释里的 "dev-xxx 开发构建 ok=false" 在新比较器下仍然 ok=false (没有 v 开头).
+同类代码 (拿 cmp == 0 当 "同一个版本") 都要这样复查; 判是不是同一个包本来就应该用整串 ==.
+
+
+四、已部署的旧二进制怎么升上来
+------------------------------------------------------------
+旧二进制的比较器是 v0.0.6 及以前的, 看不懂新格式, 只能由服务端降格 (formatMigration.md 第二节).
+降格: 给旧通道一个【旧格式】、在旧比较器下比它当前版本更新的串, 下载时再映射回真实的新格式包. 例:
+    真实版本   v0.20.0-261112153822-e64c21ea05-r
+    降格串     v0.20.261112153822-e64c21ea05-r      (把 "v0.20.0-" 换回旧的 "v0.20." —— 前缀第二段已经 +1, 一定比所有 v0.19.* 新)
+    互转是纯字符串替换 (只在前缀第三段是 0 时成立; 迁移期间别动第三段), 不用存映射表.
+    用 v0.0.4 编出来的旧二进制 (例 hgmOpsAgentProj) 认的是 commitId 和脏否用 '.' 分隔的格式 (…-e64c21ea05.r), 降格串照它的格式拼.
+全部机器升上来之后删掉降格代码. 没有自更新流程的项目不用管这一节.
+
+
+五、本库内部 (给维护者)
+------------------------------------------------------------
+- 比较器和 golang.org/x/mod/semver 的差分测试: 容器仓库 tests/hgmBuildVersionSemver.
+- 性能: 零分配; 本库格式互比 ~130ns (旧专用解析 ~80ns), 没写快路径.

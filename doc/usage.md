@@ -22,7 +22,7 @@ exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionV
 
 ### 2. 包里放什么
 
-- zip 文件名和 zip 里的顶层目录都带版本号整串, 例 `myApp-v0.1.260909155041-a1b2c3d4e5-r.zip`。
+- zip 文件名和 zip 里的顶层目录都带版本号整串, 例 `myApp-v0.0.1-260909155041-a1b2c3d4e5-r.zip`。
   文件名只给人看, 程序不从文件名里取版本号。
 - zip 里放一个固定文件 `version.txt`, 内容就是版本号整串 (一行, 和 `version` 子命令的输出一样)。
   ★程序要知道"这个 zip 是哪个版本"时, 一律读它, 不解析文件名: 读出来 -> `strings.TrimSpace` -> `IsValid` -> 拿去比新旧 / `GetCommitId` 找源码。
@@ -71,6 +71,14 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 - 想让【全场】回到旧代码: 不用强制。在 git 里 checkout 旧 commit (真正的 git 工作区, 不是 archive 出来的目录),
   用 `NewBuildVersion` 重新打一个包 —— 时间戳更新, 序更大, 旧代码走正常的自动升级通道下发到所有机器。
 - 手动更新命令可以额外比文件内容 (大小 + MAC): 已经是那一版就一个字节都不传。
+- **什么时候把 `versionPrefix.txt` 的前缀 +1** (一般是最后一段, 例 `v0.0.1` -> `v0.0.2`, 改完 commit 再打包):
+  1. 改后缀格式 (本库升级改了时间戳 / commitId 的位数、字段或分隔符);
+  2. 改时区 (`GBuildTimeZoneOffsetSecond`), 否则改完后一段时间内打的包比之前的 "旧";
+  3. 2099 年之后两位年份回绕成更小的数;
+  4. 一个错误的大时间戳 (手误 / 被篡改) 被当成 "最新" 下发过, 之后同一前缀下正常打的包都比它旧、再也不算升级。
+
+  前缀 +1 之后, 新前缀下的任何版本号 (后缀长什么样都行) 在旧二进制的 `IsUpgrade` 眼里都是升级, 走的还是上面这条自动升级通道:
+  不用开新的升级通道, 也不用在旧二进制里留兼容代码。理由见 [design.md「前缀 +1, 不开新的升级通道」](design.md)。
 
 ### 3. 版本号当路径 / 嵌进脚本: 入口处先过 `IsValid`
 
@@ -83,7 +91,7 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 都在【进入本机的那个入口】过一次 `IsValid`, 不合法就当没有 / 直接报错。
 合法版本号的字符集锁死在 `[0-9a-zA-Z.-]`, 不会路径穿越、不会注入; 但拼 URL / 拼 shell 时照常转义。
 
-★当目录名用【整串】, 不要只取前面的序: 同一秒打的两个不同 commit 的包序相同, 只取序会撞进同一个目录互相覆盖。
+★当目录名用【整串】, 不要只取一部分 (例 只取前缀 + 时间戳): 同一秒打的两个不同 commit 的包会撞进同一个目录互相覆盖。
 写入和读取 (暂存、分发、http 路由) 必须是同一个口径。
 
 ### 4. "是不是这一个包": 用整串 `==`
@@ -115,7 +123,7 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 这几种测试都是全自动的, 不需要人改任何文件、提交任何东西。测试过程中只做"部署新版本的中心服务"这一个动作,
 之后不对客户端做任何操作: 升级必须由客户端自己收到更新事件并完成, 测试只等结果。
 
-测试会在几秒内连着打好几个包, 常常落在同一秒 (序相等, 不算升级): 用 `AddTimeSecond` 把本次打出来的版本号挪开。
+测试会在几秒内连着打好几个包, 常常落在同一秒 (先后只由 commitId / 脏否决定, 不一定算升级): 用 `AddTimeSecond` 把本次打出来的版本号挪开。
 这是 `AddTimeSecond` 唯一的用处, 正式打包不挪。
 
 ### 1. 同一份代码的升级测试 (常设, 每次都跑)
@@ -147,7 +155,7 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 测试里只写死一个常量, 每次发版之后改成新的线上版本:
 
 ```go
-const oldVersion = "v0.1.261001101926-f0e1d2c3b4-r" // 线上机器自报的那一串 (或者旧 zip 里 version.txt 的内容)
+const oldVersion = "v0.0.1-261001101926-f0e1d2c3b4-r" // 线上机器自报的那一串 (或者旧 zip 里 version.txt 的内容)
 oldCommit, ok := hgmBuildVersion.GetCommitId(oldVersion) // 不要另抄一份 commitId 常量
 ```
 
@@ -197,27 +205,30 @@ older, err := hgmBuildVersion.AddTimeSecond(ver, -(int64(verTime.Sub(installedTi
 ```
 
 - 只用在测试里。生产上降级走人工卸载重装 (见二、2 节), 不造 "更旧" 的版本号; 正式打包也不挪时间戳。
-- 序相等的包 (同一个版本号重推) 也会被拒, 但那测的是 "同版本不升"; 这里测的是 "严格更旧不升", 两条都要有。
+- 同一个版本号重推也会被拒, 但那测的是 "同版本不升"; 这里测的是 "严格更旧不升", 两条都要有。
 
 ## 五、GitHub 发布线上包 (一个 zip)
 
 ### 1. 发布
 
-- **对外发布时, 人认为一个前缀才是一个版本**: 一个前缀 (`versionPrefix.txt` 的内容, 例 `v0.4`) 只往 GitHub 发布【一次】,
+- **对外发布时, 人认为一个前缀才是一个版本**: 一个前缀 (`versionPrefix.txt` 的内容, 例 `v0.0.4`) 只往 GitHub 发布【一次】,
   一个 tag、一个 release、一个 zip。版本号后面的时间戳和 commitId 只用来找打包时间和源码, 不是给外部用户区分版本用的。
-- 下一次对外发布 = 先把 `versionPrefix.txt` 升一级 (例 `v0.5`) 并 commit + push, 再在干净的工作区里用 `NewBuildVersion` 打包、发布。
+- 下一次对外发布 = 先把 `versionPrefix.txt` 的最后一段 +1 (例 `v0.0.5`) 并 commit + push, 再在干净的工作区里用 `NewBuildVersion` 打包、发布。
   版本号末尾必须是 `-r` (`-d` 的包有未提交的修改, 拿着版本号找不回准确的源码); 打包前确认 HEAD (含子模块) 都推送了, 否则别人找不到代码。
   同一个前缀下内部打的那些包 (时间戳不同) 只在内部分发 (第二节的中心推送), 不上 GitHub。
 - 正式打包出来的 zip, 文件名带完整版本号, 作为这个 release 唯一的附件:
 
   ```sh
-  gh release create v0.4 --target "$commitId" --title v0.4 --notes "..." "bin/myApp-$ver.zip"
+  gh release create v0.0.4 --target "$commitId" --title v0.0.4 --notes "..." "bin/myApp-$ver.zip"
   ```
 
   `--target` 填打包时的完整 commitId (`git rev-parse HEAD`), 让 tag 正好指向打包的那个 commit; 不填时 GitHub 用默认分支的最新 commit 建 tag, 不一定是打包的那个。
 - 一个 zip 包含所有平台, 和内部分发用的是同一个包, 不另打一份。
 - 除了这个 tag 以外, 发布不往 git 里写任何东西。找源码以 zip 里的版本号 (`GetCommitId`) 为准, tag 只方便人记。
-- `v0.4` 这种两段的 tag 不是 Go module 认的版本格式 (要三段), 仓库同时是 Go module 时也不会混进 module 的版本列表。
+- 前缀是三段, tag (例 `v0.0.4`) 就是合法的 Go module 版本号: 仓库同时是 Go module 时, 它会出现在 module 的版本列表里, `go get ...@latest` 也会认它。
+  这通常没坏处 (那个 commit 本来就能编), 但要知道: tag 一旦推上去, Go 的 module proxy / sumdb 就会记住它, 不要删了重打、更不要挪到别的 commit。
+  不想让 tag 进 module 版本列表的话, tag 名加个不是 semver 的前缀 (例 `release-v0.0.4`)。
+- 版本号在 semver 意义下比 tag 小 (`v0.0.4-<时间戳>-...` 是 `v0.0.4` 的预发布), 无所谓: 客户端比的是版本号整串, 不比 tag。
 
 ### 2. 客户端从 GitHub 拿最新版本
 
