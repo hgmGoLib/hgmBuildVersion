@@ -39,7 +39,7 @@ func GetBuildTime(version string) (time.Time, bool) {
 // 用途: 升级的自动测试里拉开两个包的序 —— 测试会在几秒内连着打好几个包, 常常落在同一秒, 序相等就不算升级:
 //   - 同一份代码的升级测试: base 装好后再打 next, next 往后挪到比 base 新;
 //   - 从 git 打旧版本再升到新版本的测试: 新包往后挪到比旧版本新;
-//   - 拒绝降级的测试: 往前挪, 造一个比已装版本严格更旧的包。
+//   - 降级的测试 (服务端升级闸门拒绝降级 / 客户端按服务端指示降级): 往前挪, 造一个比已装版本严格更旧的包。
 //
 //	next, _ := NewBuildVersion("versionPrefix.txt")
 //	if !IsUpgrade(base, next) {

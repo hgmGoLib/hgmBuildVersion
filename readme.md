@@ -26,9 +26,9 @@ Versions for built binaries: every build gets a new version automatically, with 
 - `AddTimeSecond(ver, second int64) (string, error)` — shift the timestamp by `second` (may be negative) with real clock carry; prefix, commit id and flag unchanged. For upgrade tests that build several packages within the same second: shift the version you just built so it is newer (or older) than the other one. Normal builds do not need it.
 - `GBuildTimeZoneOffsetSecond` — fixed UTC offset (seconds) for the timestamp, default `8*3600` (UTC+8). Pick it once per project and never change it: the zone is not part of the version string, so changing it breaks the order.
 - `IsValid(ver) bool` — strict whole-string check of this library's own format (any other semver, e.g. `v1.2.3`, is `false`). A valid version contains only `[0-9a-zA-Z.-]` and can never contain `/` or `..`, so it is safe as a file/directory name after this check.
-- `IsUpgrade(cur, target) bool` — true only if `target` is strictly newer by semver 2.0.0 precedence. Works for any semver (`v` required, all three parts required, length ≤ 256); invalid input (including `""`) → `false`.
+- `IsUpgrade(cur, target) bool` — true only if `target` is strictly newer by semver 2.0.0 precedence. Works for any semver (`v` required, all three parts required, length ≤ 256); invalid input (including `""`) → `false`. Use it only in code you can still change (the new program doing a server upgrade, or the update server). A self-updating client must not call it: it asks the server and upgrades when the answer differs from its own version (see `doc/upgradeCheckpoint.txt`).
 - `CompareOrder(a, b) (cmp int, ok bool)` — three-way semver 2.0.0 precedence compare (-1 / 0 / 1) for sorting, max, `>=`. Build metadata (`+xxx`) is accepted and ignored, as the spec says. Zero allocation. Invalid input → `ok=false`; always check `ok` first.
-- To change the suffix format later, or to jump over a wrong "newest" version: bump the prefix (e.g. `v0.0.1` → `v0.0.2`). Any semver comparator then sees every new version as newer, no new upgrade channel needed.
+- Self-updating clients never compare versions, so changing the format later only touches the update server. For a server upgrade that the new comparator gets wrong, use `-force` once or bump the prefix (e.g. `v0.0.1` → `v0.0.2`).
 - Sub package `hgmBuildVersionCurrent`: `go build -ldflags "-X "+GetVersionVarFullName()+"="+ver`, then `GetCurrentVersion()` at runtime.
 - `ts/hgmBuildVersion.ts` — TypeScript `IsValid` / `IsUpgrade` / `CompareOrder` for front ends, checked against the same `testdata/cases.json` as the Go code.
 
@@ -40,6 +40,8 @@ Treat a version as an opaque string: pass it around, compare with `==`, hand it 
 
 1. **这个字符串是不是合法的版本号?** —— 合法的版本号可以直接当文件名 / 目录名片段用, 不会路径穿越。
 2. **target 相对 cur 是不是一次升级?** —— 严格更新才算, 同版本 / 降级 / 看不懂 一律不算。
+   ★只给还能改的代码用 (服务端升级时的新程序 / 下发更新的服务端)。会自更新的客户端【禁止比新旧】: 上报版本号, 由服务端决定, 客户端只判整串是否相等。
+   完整流程和对接检查点见 [doc/upgradeCheckpoint.txt](doc/upgradeCheckpoint.txt)。
 
 需求约束 (选不选本库先看这里):
 
@@ -50,7 +52,7 @@ Treat a version as an opaque string: pass it around, compare with `==`, hand it 
 典型用途:
 
 - **拿着版本号找到编译时的源代码**: 版本号里带着打包时 git HEAD 的 commitId, 线上跑着的二进制报出版本号, `git checkout <commitId>` 就是它的代码。末尾是 `-d` 的包打包时有未提交的修改, 只能找到最接近的那个 commit; commit 没推送到共享仓库时别人也找不到。
-- 程序自更新时判断 "要不要换成下载到的那个版本"。
+- 服务端升级时, 新程序判断 "线上跑的是不是都比这个包旧" (默认只许旧 -> 新, `-force` 放行); 下发更新的服务端决定客户端该升到哪个版本。
 - 按版本号建目录存放各版本的二进制。
 - 日志 / 接口里上报自己的版本。
 
@@ -79,7 +81,7 @@ v0.0.1-260909155041-a1b2c3d4e5-r
 
 在仓库里放 `versionPrefix.txt`, 内容形如 `v0.0.1` (三段十进制, 不许前导零)。需要时人手改, 一般只把最后一段 +1。
 
-- **前缀 +1 就够, 不用开新的升级通道**: 改后缀格式、改时区、2099 年两位年份回绕、被一个错误的大时间戳占住 "最新" —— 这些情况都把前缀 +1 (例 `v0.0.1` → `v0.0.2`)。新前缀下的任何版本号, 在任何 semver 比较器眼里都比旧前缀的新。
+- 改后缀格式、改时区、2099 年两位年份回绕、被一个错误的大时间戳占住 "最新": 客户端不比新旧, 不受影响; 服务端升级的闸门判错时, 用 `-force` 升这一次, 或者把前缀 +1 (例 `v0.0.1` → `v0.0.2`, 新前缀下的任何版本号在 semver 眼里都比旧前缀的新)。
 - 两段 (`v0.19`, v0.0.6 及以前的格式) / 一段 / 带 `-` `+` 的前缀 `NewBuildVersion` 直接返回 error, 报错信息写明该改成什么 (两段 `v0.N` 改成 `v0.(N+1).0`, 见 [doc/upgradeFromV0.0.6.txt](doc/upgradeFromV0.0.6.txt))。
 
 ### 2. 打包侧: 生成版本号并注入二进制
@@ -100,7 +102,7 @@ cmd := exec.Command("go", "build",
 工作区有未提交修改时照样能打, 只是末尾变成 `-d`。`versionPrefix.txt` 写错时 `NewBuildVersion` 直接返回 error。
 没有 git (例如从源码压缩包构建) 或该文件没被 git 跟踪 (没 `git add` / 被 .gitignore 掉) 时也直接返回 error。
 
-**时区一个项目定一次, 之后不要改**: 时区不写进版本号, 而时间戳决定新旧; 比如从 UTC+8 改成 UTC, 改完后 8 小时内打的包比改之前的"旧", 不算升级。非改不可时同时把 `versionPrefix.txt` 的前缀 +1 顶过去。
+**时区一个项目定一次, 之后不要改**: 时区不写进版本号, 而时间戳决定新旧; 比如从 UTC+8 改成 UTC, 改完后 8 小时内打的包比改之前的"旧", 服务端升级的闸门会拒绝。非改不可时同时把 `versionPrefix.txt` 的前缀 +1 顶过去 (或者那段时间里用 `-force`)。
 
 也可以不用 `-X`: 在程序开始的位置直接赋值 `hgmBuildVersionCurrent.GVersion = ver` (例如由生成代码写进 main 包)。
 
@@ -126,6 +128,7 @@ hgmBuildVersion.CompareOrder(a, b) (cmp int, ok bool) // semver 2.0.0 优先级:
 - 排序 / 取较新的 / 判 "不比它旧" 用 `CompareOrder`, **先看 ok 再看 cmp**。
   "b 不比 a 旧" 要写 `cmp, ok := CompareOrder(b, a); ok && cmp >= 0`, 不要写 `!IsUpgrade(b, a)`: 那样非法版本号也会被当成"不比它旧"放过去。
 - 判同一个包用整串 `==`, 不用 `cmp == 0`。
+- ★`IsUpgrade` / `CompareOrder` 只在服务端用 (服务端升级的新程序 / 下发更新的服务端)。会自更新的客户端不许调: 编进客户端的比较器部署出去就改不了, 以后格式一变旧客户端就静默不升。见 [doc/upgradeCheckpoint.txt](doc/upgradeCheckpoint.txt)。
 
 ### 5. 找源码
 
@@ -149,7 +152,7 @@ tm, ok := hgmBuildVersion.GetBuildTime(ver) // 时区 = GBuildTimeZoneOffsetSeco
 
 ### 7. 升级测试里拉开序: `AddTimeSecond`
 
-升级的自动测试会在几秒内连着打好几个包, 常常落在同一秒: 同一秒的两个包先后只由 commitId / 脏否决定, 不一定是升级。这时把本次打出来的版本号挪一挪:
+升级的自动测试会在几秒内连着打好几个包, 常常落在同一秒: 同一秒的两个包先后只由 commitId / 脏否决定, 不一定是升级 (同一秒、同一 commit、同样脏否时连整串都相同)。这时把本次打出来的版本号挪一挪:
 
 ```go
 next, err := hgmBuildVersion.NewBuildVersion("versionPrefix.txt")
@@ -158,7 +161,7 @@ if !hgmBuildVersion.IsUpgrade(base, next) {
 }
 ```
 
-- 用在: 同一份代码的升级测试 (base -> next)、从 git 打旧版本再升到新版本的测试、拒绝降级的测试 (往前挪, 造一个严格更旧的包)。具体见 [doc/usage.md](doc/usage.md) 第四节。
+- 用在: 同一份代码的升级测试 (base -> next)、从 git 打旧版本再升到新版本的测试、服务端升级闸门拒绝降级的测试 / 客户端按服务端指示降级的测试 (往前挪, 造一个严格更旧的包)。具体见 [doc/usage.md](doc/usage.md) 第四节。
 - **正式打包不用它**: 正常打包间隔远大于 1 秒, 靠当前时间就够。
 - 按真实时间进位: `…153059` 加 1 秒是 `…153100`, 不是 `…153060`。秒数可正可负。
 - 前缀 / commitId / 脏否原样不动 (同一秒时 commitId 也参与先后, 所以挪 1 秒是保证升级的唯一办法)。**挪本次打出来的版本号, 不要挪别的包的**: 挪别的包的会让新包顶着别人的 commitId, 拿着它找到的是别的代码。
@@ -174,6 +177,7 @@ if !hgmBuildVersion.IsUpgrade(base, next) {
 
 golang.org/x/mod/semver 的差分测试在容器仓库的 `tests/hgmBuildVersionSemver` (不进本库的 go.mod)。
 
+升级流程 (服务端升级 / 客户端升级) 和对接检查点见 [doc/upgradeCheckpoint.txt](doc/upgradeCheckpoint.txt)。
 实战用法 (自更新怎么写 / 版本号显示在哪 / 升级的真机自动测试 / GitHub 发布) 见 [doc/usage.md](doc/usage.md)。
 设计取舍见 [doc/design.md](doc/design.md) 和 [doc/binaryAndLibVersion.md](doc/binaryAndLibVersion.md)。
-改版本号格式 / 从别的版本号格式迁过来 (已部署的旧二进制怎么升上来) 见 [doc/formatMigration.md](doc/formatMigration.md); 从 v0.0.6 及以前升上来见 [doc/upgradeFromV0.0.6.txt](doc/upgradeFromV0.0.6.txt)。
+改版本号格式 / 从别的版本号格式迁过来 (还在客户端里比新旧的已部署旧二进制怎么升上来) 见 [doc/formatMigration.md](doc/formatMigration.md); 从 v0.0.6 及以前升上来见 [doc/upgradeFromV0.0.6.txt](doc/upgradeFromV0.0.6.txt)。

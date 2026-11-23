@@ -1,6 +1,7 @@
 # hgmBuildVersion 实战用法
 
 API 见 `../readme.md`。这里写的是"一个会自更新的程序, 版本号相关的事情具体怎么做"。
+升级流程本身 (服务端升级 / 客户端升级) 和对接检查点以 [upgradeCheckpoint.txt](upgradeCheckpoint.txt) 为准, 本文只补具体写法。
 下文以这种结构为例: 一个中心服务 + 装在多台机器上的客户端, 客户端由中心推送自更新; 升级流程有真机自动测试。照着做就行, 不用再自己做决策。
 
 ## 一、打包侧
@@ -25,8 +26,8 @@ exec.Command("go", "build", "-ldflags", "-X "+hgmBuildVersionCurrent.GetVersionV
 - zip 文件名和 zip 里的顶层目录都带版本号整串, 例 `myApp-v0.0.1-260909155041-a1b2c3d4e5-r.zip`。
   文件名只给人看, 程序不从文件名里取版本号。
 - zip 里放一个固定文件 `version.txt`, 内容就是版本号整串 (一行, 和 `version` 子命令的输出一样)。
-  ★程序要知道"这个 zip 是哪个版本"时, 一律读它, 不解析文件名: 读出来 -> `strings.TrimSpace` -> `IsValid` -> 拿去比新旧 / `GetCommitId` 找源码。
-  ★`IsValid` 不 trim (带 `\n` / `\r\n` 一律判 false, 于是 `IsUpgrade` 也是 false): 忘了 trim 的表现是"静默永不升级"。
+  ★程序要知道"这个 zip 是哪个版本"时, 一律读它, 不解析文件名: 读出来 -> `strings.TrimSpace` -> `IsValid` -> 拿去判等 / (服务端) 比新旧 / `GetCommitId` 找源码。
+  ★`IsValid` 不 trim (带 `\n` / `\r\n` 一律判 false, 于是 `IsUpgrade` 也是 false): 忘了 trim 的表现是"服务端升级被拒" / "客户端和目标永远不相等"。
   `IsValid` 为 false 时要打日志带上原串, 不要静默跳过。
 - 如果有中心服务负责分发, 它的配置里写"当前发布版本 = 这个 ver", 由安装包自己带过去, 不让人手填。
 
@@ -40,7 +41,8 @@ cur := hgmBuildVersionCurrent.GetCurrentVersion()
 
 - 全程序只从这里取。不要在 main 包或别处再声明一个版本变量, 也不要再单独注入 commitId / 脏否 (它们已经在版本号里)。
 - 开发机直接 `go build` 没注入时是空串。【保持空串】, 不要造 `v0.0.0` 之类的哨兵:
-  空串天然 `IsValid()==false`、天然赢不了任何一次 `IsUpgrade`, 开发版本永远不会被当成可以升级 / 可以分发的版本。
+  空串天然 `IsValid()==false`、天然赢不了任何一次 `IsUpgrade`, 开发版本永远不会被当成可以分发的版本;
+  客户端报上来空串时升不升由服务端定 (一般是不升, 开发机上的东西别被自动换掉)。
 - 如果某个配置文件里也存了"当前版本" (例如 agent 的配置), 启动时用二进制自带的版本号覆盖它 (二进制没注入时才保留配置里的值, 方便本地调试):
 
   ```go
@@ -49,36 +51,51 @@ cur := hgmBuildVersionCurrent.GetCurrentVersion()
   }
   ```
 
-  ★这是自更新能【收敛】的关键: 换了二进制之后"当前版本"必须跟着变, 否则和"最新版本"比永远是旧的, 会无限自更新。
+  ★这是自更新能【收敛】的关键: 换了二进制之后"当前版本"必须跟着变, 否则和服务端给的目标永远不相等, 会无限自更新。
 
-### 2. 升级闸门: 默认和自动触发过 `IsUpgrade`, 人手操作可以强制
+### 2. 升级判断: 客户端只判相等, 新旧由服务端判
+
+流程和理由见 [upgradeCheckpoint.txt](upgradeCheckpoint.txt) 第一节, 这里只给写法。
+
+**客户端 (会自更新的程序)**:
 
 ```go
-if force || hgmBuildVersion.IsUpgrade(cur, latest) {
-    // 拉新二进制 -> 校验 -> 替换 -> 重启
+// resp 来自 rpc: 上报 {CurrentVersion: cur, DeviceId: id}, 服务端回 {TargetVersion, DownloadUrl, Sha256}
+if resp.TargetVersion != "" && resp.TargetVersion != cur {
+    // 下载 -> 校验 sha256 -> 替换 -> 重启
 }
 ```
 
-- 自动触发点通常有两个, 都必须过 `IsUpgrade`, 不能有任何一处用 `!=`:
-  1. 中心推送"有新版本" (实时事件 / 广播, 载荷就是版本号原串);
-  2. 程序启动后主动问一次中心 (不轮询)。
-  中心判过一次、客户端收到后【再判一次】: 多个触发点共用同一个"执行升级"函数, 闸门放在客户端那一处最不容易漏。
-- 自动触发时同版本 / 降级 / 版本号看不懂 一律不升: 同版本也升 = 每次触发都升 = 无限自更新; 降级不升 = 防误操作 / 回滚攻击。
-- 人在机器上敲的手动更新 / 覆盖安装命令: 默认同样过 `IsUpgrade`, 但【留一个强制选项】(例 `-Force`) 跳过它,
-  用于 重装同一版本修复损坏的安装、临时换到某个旧版本排查问题 之类。
-  - 强制只跳过 `IsUpgrade`, 【不跳过 `IsValid`】: 版本号要当路径 / 嵌进脚本, 看不懂的版本号强制也不放行。
-  - 强制降级只是暂时的: 中心的"最新版本"还是新的那个, 下一次自动触发就会把它升回去。
-- 想让【全场】回到旧代码: 不用强制。在 git 里 checkout 旧 commit (真正的 git 工作区, 不是 archive 出来的目录),
-  用 `NewBuildVersion` 重新打一个包 —— 时间戳更新, 序更大, 旧代码走正常的自动升级通道下发到所有机器。
-- 手动更新命令可以额外比文件内容 (大小 + MAC): 已经是那一版就一个字节都不传。
-- **什么时候把 `versionPrefix.txt` 的前缀 +1** (一般是最后一段, 例 `v0.0.1` -> `v0.0.2`, 改完 commit 再打包):
-  1. 改后缀格式 (本库升级改了时间戳 / commitId 的位数、字段或分隔符);
-  2. 改时区 (`GBuildTimeZoneOffsetSecond`), 否则改完后一段时间内打的包比之前的 "旧";
-  3. 2099 年之后两位年份回绕成更小的数;
-  4. 一个错误的大时间戳 (手误 / 被篡改) 被当成 "最新" 下发过, 之后同一前缀下正常打的包都比它旧、再也不算升级。
+- 客户端里不调 `IsUpgrade` / `CompareOrder`, 不加 "防降级"、退避、失败计数之类的分支。
+- 触发点通常有两个, 都走上面同一个 rpc:
+  1. 服务端推送 (实时事件 / 广播): 载荷只是 "去问一下", 不带目标版本;
+  2. 程序启动后主动问一次 (不轮询)。
+- 想让某台 / 某批 / 全场回到旧版本: 改服务端的目标版本就行, 客户端照常执行。
 
-  前缀 +1 之后, 新前缀下的任何版本号 (后缀长什么样都行) 在旧二进制的 `IsUpgrade` 眼里都是升级, 走的还是上面这条自动升级通道:
-  不用开新的升级通道, 也不用在旧二进制里留兼容代码。理由见 [design.md「前缀 +1, 不开新的升级通道」](design.md)。
+**服务端 (下发更新的那一方)**: 收到 `{CurrentVersion, DeviceId}`, 按自己的配置 / 数据库决定回什么。
+要比新旧就用 `IsUpgrade` / `CompareOrder`; 客户端报上来的版本号看不懂 (空串 / 旧格式 / dev 构建) 时怎么办也由这里定。
+升级接口要改时, 旧接口留给还没升上来的旧客户端。
+
+**服务端升级 (运维拿包升自己的服务 / 集群)**:
+
+```go
+// 旧代码只解压, 然后运行包里的新程序; 下面这段在新程序里
+if !force {
+    for _, r := range liveInstanceList {
+        if !hgmBuildVersion.IsUpgrade(r.Version, pkgVersion) {
+            return fmt.Errorf("%s on %s runs %s, not older than %s (use -force)", r.Component, r.Machine, r.Version, pkgVersion)
+        }
+    }
+}
+```
+
+- 默认只许旧 -> 新: 同版本 / 比包新 / 看不懂 都拒绝。
+- 只有一个 `-force`, 加了就跳过全部版本检查 (重装同一版本修复损坏的安装、降级、版本号看不懂都放行)。
+- `-force` 不跳过 `IsValid`: 版本号要当路径 / 嵌进脚本时, 看不懂的照样不放行 (这和新旧无关, 见下面第 3 节)。
+- 手动更新命令可以额外比文件内容 (大小 + MAC): 已经是那一版就一个字节都不传。
+
+**版本号格式 / 时区变了**: 客户端不比新旧, 不受影响, 只改服务端。服务端升级的闸门判错时 (例 改时区后几小时内打的包比之前 "旧"、
+一个错误的大时间戳被当成 "最新"、2099 年两位年份回绕), 用 `-force` 升这一次, 或者把 `versionPrefix.txt` 的前缀 +1。
 
 ### 3. 版本号当路径 / 嵌进脚本: 入口处先过 `IsValid`
 
@@ -97,6 +114,8 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 ### 4. "是不是这一个包": 用整串 `==`
 
 以下判断都是比【身份】, 用整串相等, 不用 `IsUpgrade`:
+
+- 客户端判 "服务端给的目标是不是就是我自己" (见上面第 2 节)。
 
 - 部署工具确认"目标机上跑的就是我刚打的那个包": 让远端二进制自报版本号 (`version` 子命令), 和本次打包的 ver 整串比。
   ★不要看子命令的退出码: 很多命令行框架遇到不认识的子命令是打帮助然后正常退出, 老二进制会"成功地什么都没做"。
@@ -132,7 +151,8 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 这条断了的线上表现是"发了新版本, 所有机器一动不动, 没有任何报错", 单元测试够不着。
 
 1. `base := NewBuildVersion(..)`, 用它首装中心服务和客户端, 等所有客户端上线且版本号 `== base`。
-2. `next := NewBuildVersion(..)` (同一份代码再生成一次)。两次打包常常落在同一秒, 不挪的话 `next` 不算升级, 测试会跑一个必然超时的等待:
+2. `next := NewBuildVersion(..)` (同一份代码再生成一次)。两次打包常常落在同一秒, 不挪的话 `next` 可能不算升级 (服务端升级的闸门拒绝),
+   甚至和 `base` 整串相同 (客户端判 "已经是这一版" 不动), 测试会跑一个必然超时的等待:
 
    ```go
    if !hgmBuildVersion.IsUpgrade(base, next) {
@@ -149,6 +169,7 @@ if force || hgmBuildVersion.IsUpgrade(cur, latest) {
 
 ### 2. 从旧版本升到新版本的测试 (每次发版前跑)
 
+对应 [upgradeCheckpoint.txt](upgradeCheckpoint.txt) 的 B1 / C1。
 测的是"线上正在跑的那个旧版本, 它冻住的升级代码能不能接住新版本"。风险恰恰在旧二进制身上:
 它连不上新中心 = 全场失联, 而且没有远程补救。所以旧的那一版必须是当年那个 commit 编出来的真东西, 装法也必须是旧代码自己的装法。
 
@@ -189,23 +210,25 @@ oldCommit, ok := hgmBuildVersion.GetCommitId(oldVersion) // 不要另抄一份 c
    挪的是 `next` (本次打的包), 不是 `oldVersion`: 旧包的版本号必须是当年那一串原样。挪完照样断言 `IsUpgrade(oldVersion, next)`, 前缀不同时挪不过去。
 2. 清场, 用旧 zip / 旧代码装中心服务和客户端, 等所有客户端上线且版本号 `== oldVersion`。
 3. 用当前代码部署新版本的中心服务, 断言中心自报 `== next`。
-4. 不碰客户端, 等所有客户端版本号 `== next`。
+4. 不碰客户端, 等所有客户端版本号 `== next`; 再让客户端问一次, 服务端回 "不用升"。
 5. 断言: 身份 / 信任关系 / 配置 / 已有的服务进程在升级前后不变。
 
-### 3. 拒绝降级的测试
+### 3. 降级的测试: 服务端升级拒绝, 客户端照服务端降
 
-要一个 "比已装版本严格更旧、但签名合法" 的包, 验证客户端会拒装。现在打出来的包永远比已装的新, 所以把本次打出来的版本号往前挪:
+对应 [upgradeCheckpoint.txt](upgradeCheckpoint.txt) 的 B2 / C2 / C3。要一个 "比已装版本严格更旧、但签名合法" 的包。
+现在打出来的包永远比已装的新, 所以把本次打出来的版本号往前挪:
 
 ```go
 ver, _ := hgmBuildVersion.NewBuildVersion("versionPrefix.txt")
 verTime, _ := hgmBuildVersion.GetBuildTime(ver)
 installedTime, _ := hgmBuildVersion.GetBuildTime(installed)
 older, err := hgmBuildVersion.AddTimeSecond(ver, -(int64(verTime.Sub(installedTime)/time.Second) + 1))
-// 断言 CompareOrder(older, installed) 是 (-1, true), 再用 older 打包、签名、推给客户端, 等它拒绝。
+// 断言 CompareOrder(older, installed) 是 (-1, true), 再用 older 打包、签名。
 ```
 
-- 只用在测试里。生产上降级走人工卸载重装 (见二、2 节), 不造 "更旧" 的版本号; 正式打包也不挪时间戳。
-- 同一个版本号重推也会被拒, 但那测的是 "同版本不升"; 这里测的是 "严格更旧不升", 两条都要有。
+- 服务端升级: 用 `older` 升, 不加 `-force` 要被拒绝; 加 `-force` 要成功。同版本、线上版本号看不懂这两种也各测一遍。
+- 客户端: 服务端把目标指到 `older`, 客户端要真的降过去。这条证明客户端里没有残留的新旧判断, 不能省。
+- 只用在测试里, 正式打包不挪时间戳。
 
 ## 五、GitHub 发布线上包 (一个 zip)
 
@@ -237,10 +260,12 @@ GET https://api.github.com/repos/<owner>/<repo>/releases/latest
   -> tag_name / assets[]: name / browser_download_url
 ```
 
-1. 取最新 release 里的那个 zip (每个 release 只有一个 zip 附件), 下载。
-2. 校验完整性 (例如用自己的密钥对包算 MAC; 不要只靠 HTTPS)。
-3. 读 zip 里的 `version.txt` -> `IsValid` -> `IsUpgrade(cur, 它)` 为真才安装 (或者人手 `-Force`)。
-   "最新 release" 只是 GitHub 那边的顺序, 最终闸门还是 `IsUpgrade`: 有人误把旧包标成了最新, 客户端也不会跟着降级。
+这时 GitHub 就是"服务端": 哪个 release 标成最新, 就是服务端给的目标版本。
+
+1. 取最新 release 里的那个 zip (每个 release 只有一个 zip 附件)。zip 文件名带完整版本号, 和自己的版本号整串相等就不用下载。
+2. 下载, 校验完整性 (例如用自己的密钥对包算 MAC; 不要只靠 HTTPS)。
+3. 读 zip 里的 `version.txt` -> `IsValid` -> 和 `cur` 整串不相等就安装。客户端不比新旧:
+   想回滚就把旧 release 标成最新; 标错了就改回来, 客户端跟着走。
 
 ### 3. 拿某个版本的源码
 
